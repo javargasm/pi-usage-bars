@@ -1,0 +1,37 @@
+{
+  "name": "pi-usage-bars",
+  "version": "0.1.0",
+  "description": "Production-ready /usage bars extension for pi (Codex, Claude, Z.AI, Gemini CLI, Antigravity)",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "extension",
+    "usage",
+    "codex",
+    "anthropic",
+    "gemini",
+    "antigravity"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "bun test tests/usage-bars-core.test.ts",
+    "test:all": "bun run tests/run-all.ts",
+    "prepublishOnly": "npm run test"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/usage-bars/index.ts"
+    ]
+  }
+}

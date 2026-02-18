@@ -1,0 +1,486 @@
+import { describe, expect, it } from "bun:test";
+import {
+  canShowForProvider,
+  detectProvider,
+  discoverGoogleProjectId,
+  ensureFreshAuthForProviders,
+  extractUsageFromPayload,
+  fetchAllUsages,
+  fetchClaudeUsage,
+  fetchCodexUsage,
+  fetchGoogleUsage,
+  fetchZaiUsage,
+  formatDuration,
+  formatResetsAt,
+  parseGoogleQuotaBuckets,
+  pickMostUsedBucket,
+  readLimitPercent,
+  readPercentCandidate,
+  resolveUsageEndpoints,
+  usedPercentFromRemainingFraction,
+  type AuthData,
+  type FetchLike,
+  type FetchResponseLike,
+  type UsageEndpoints,
+} from "../extensions/usage-bars/core";
+
+function jsonResponse(status: number, body: any): FetchResponseLike {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+  };
+}
+
+function invalidJsonResponse(status = 200): FetchResponseLike {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => {
+      throw new Error("bad json");
+    },
+  };
+}
+
+describe("usage-bars-core formatting", () => {
+  it("formats durations across units", () => {
+    expect(formatDuration(0)).toBe("now");
+    expect(formatDuration(30)).toBe("<1m");
+    expect(formatDuration(61)).toBe("1m");
+    expect(formatDuration(3660)).toBe("1h 1m");
+    expect(formatDuration(90000)).toBe("1d 1h");
+  });
+
+  it("formats reset date relative to fixed now and handles invalid dates", () => {
+    const now = Date.parse("2026-02-18T12:00:00.000Z");
+    expect(formatResetsAt("2026-02-18T13:30:00.000Z", now)).toBe("1h 30m");
+    expect(formatResetsAt("not-a-date", now)).toBe("");
+    expect(formatResetsAt("2026-02-18T11:00:00.000Z", now)).toBe("now");
+  });
+});
+
+describe("usage-bars-core percent parsing", () => {
+  it("parses percent candidates from fractions and percentages", () => {
+    expect(readPercentCandidate(0.37)).toBe(37);
+    expect(readPercentCandidate(1)).toBe(1);
+    expect(readPercentCandidate(99)).toBe(99);
+    expect(readPercentCandidate(101)).toBeNull();
+    expect(readPercentCandidate("50")).toBeNull();
+  });
+
+  it("reads limit percent directly or from current/remaining", () => {
+    expect(readLimitPercent({ utilization: 44 })).toBe(44);
+    expect(readLimitPercent({ currentValue: 30, remaining: 70 })).toBe(30);
+    expect(readLimitPercent({ currentValue: 0, remaining: 0 })).toBeNull();
+  });
+});
+
+describe("usage-bars-core payload extraction", () => {
+  it("extracts usage from typed limits arrays", () => {
+    const payload = {
+      data: {
+        limits: [
+          { type: "TIME_LIMIT", usage_percent: 25 },
+          { type: "TOKENS_LIMIT", currentValue: 20, remaining: 80 },
+        ],
+      },
+    };
+
+    expect(extractUsageFromPayload(payload)).toEqual({ session: 25, weekly: 20 });
+  });
+
+  it("extracts usage from fallback fields", () => {
+    const payload = {
+      rate_limit: {
+        primary_window: { used_percent: 35 },
+        secondary_window: { used_percent: 45 },
+      },
+    };
+
+    expect(extractUsageFromPayload(payload)).toEqual({ session: 35, weekly: 45 });
+  });
+
+  it("returns null for unknown payload shape", () => {
+    expect(extractUsageFromPayload({ nope: true })).toBeNull();
+  });
+});
+
+describe("usage-bars-core google buckets", () => {
+  it("converts remaining fraction to used percent", () => {
+    expect(usedPercentFromRemainingFraction(0.25)).toBe(75);
+    expect(usedPercentFromRemainingFraction(-1)).toBe(100);
+    expect(usedPercentFromRemainingFraction(5)).toBe(0);
+    expect(usedPercentFromRemainingFraction("x")).toBeNull();
+  });
+
+  it("picks the most used bucket", () => {
+    const selected = pickMostUsedBucket([
+      { remainingFraction: 0.6, id: "a" },
+      { remainingFraction: 0.1, id: "b" },
+      { remainingFraction: 0.4, id: "c" },
+    ]);
+    expect(selected?.id).toBe("b");
+  });
+
+  it("parses gemini buckets with provider-specific preferences", () => {
+    const parsed = parseGoogleQuotaBuckets(
+      {
+        buckets: [
+          { tokenType: "REQUESTS", modelId: "gemini-2.5-pro", remainingFraction: 0.4 },
+          { tokenType: "REQUESTS", modelId: "gemini-2.5-flash", remainingFraction: 0.2 },
+        ],
+      },
+      "gemini",
+    );
+
+    expect(parsed).toEqual({ session: 60, weekly: 80 });
+  });
+
+  it("parses antigravity buckets preferring non-thinking claude for session", () => {
+    const parsed = parseGoogleQuotaBuckets(
+      {
+        buckets: [
+          { tokenType: "REQUESTS", modelId: "claude-3.7-sonnet", remainingFraction: 0.7 },
+          { tokenType: "REQUESTS", modelId: "gemini-2.5-pro", remainingFraction: 0.1 },
+          { tokenType: "REQUESTS", modelId: "gemini-2.5-flash", remainingFraction: 0.5 },
+        ],
+      },
+      "antigravity",
+    );
+
+    expect(parsed).toEqual({ session: 30, weekly: 50 });
+  });
+});
+
+describe("usage-bars-core provider detection and visibility", () => {
+  it("detects known providers only", () => {
+    expect(detectProvider({ provider: "openai-codex" })).toBe("codex");
+    expect(detectProvider({ provider: "google-gemini-cli" })).toBe("gemini");
+    expect(detectProvider("gpt-4.1")).toBeNull();
+    expect(detectProvider({ provider: "openai" })).toBeNull();
+  });
+
+  it("checks whether provider usage can be shown", () => {
+    const auth: AuthData = {
+      "openai-codex": { access: "a" },
+      anthropic: { access: "b" },
+      zai: { key: "c" },
+      "google-gemini-cli": { access: "d" },
+    };
+    const endpoints: UsageEndpoints = {
+      zai: "https://z.ai",
+      gemini: "https://gemini",
+      antigravity: "",
+      googleLoadCodeAssistEndpoints: [],
+    };
+
+    expect(canShowForProvider("codex", auth, endpoints)).toBe(true);
+    expect(canShowForProvider("antigravity", auth, endpoints)).toBe(false);
+    expect(canShowForProvider("zai", auth, { ...endpoints, zai: "" })).toBe(false);
+  });
+});
+
+describe("usage-bars-core network fetchers", () => {
+  it("discovers google project id from env before network", async () => {
+    let calls = 0;
+    const fetchFn: FetchLike = async () => {
+      calls += 1;
+      return jsonResponse(200, {});
+    };
+
+    const id = await discoverGoogleProjectId("token", {
+      fetchFn,
+      env: { GOOGLE_CLOUD_PROJECT: "proj-from-env" } as any,
+      endpoints: resolveUsageEndpoints(),
+    });
+
+    expect(id).toBe("proj-from-env");
+    expect(calls).toBe(0);
+  });
+
+  it("discovers google project id from loadCodeAssist fallback endpoints", async () => {
+    const calls: string[] = [];
+    const fetchFn: FetchLike = async (url) => {
+      calls.push(url);
+      if (url.startsWith("https://cloudcode-pa.googleapis.com/")) {
+        return jsonResponse(500, { error: true });
+      }
+      return jsonResponse(200, { cloudaicompanionProject: { id: "project-2" } });
+    };
+
+    const id = await discoverGoogleProjectId("token", {
+      fetchFn,
+      env: {} as any,
+      endpoints: {
+        zai: "",
+        gemini: "",
+        antigravity: "",
+        googleLoadCodeAssistEndpoints: [
+          "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+          "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist",
+        ],
+      },
+    });
+
+    expect(id).toBe("project-2");
+    expect(calls.length).toBe(2);
+  });
+
+  it("fetches codex usage and handles http/json failures", async () => {
+    const ok = await fetchCodexUsage("token", {
+      fetchFn: async () =>
+        jsonResponse(200, {
+          rate_limit: {
+            primary_window: { used_percent: 42, reset_after_seconds: 120 },
+            secondary_window: { used_percent: 73, reset_after_seconds: 240 },
+          },
+        }),
+    });
+
+    expect(ok).toMatchObject({ session: 42, weekly: 73, sessionResetsIn: "2m", weeklyResetsIn: "4m" });
+
+    const badHttp = await fetchCodexUsage("token", { fetchFn: async () => jsonResponse(401, {}) });
+    expect(badHttp.error).toBe("HTTP 401");
+
+    const badJson = await fetchCodexUsage("token", { fetchFn: async () => invalidJsonResponse() });
+    expect(badJson.error).toBe("invalid JSON response");
+  });
+
+  it("fetches claude usage with extra spend", async () => {
+    const usage = await fetchClaudeUsage("token", {
+      fetchFn: async () =>
+        jsonResponse(200, {
+          five_hour: { utilization: 55, resets_at: "2026-02-18T13:00:00.000Z" },
+          seven_day: { utilization: 22, resets_at: "2026-02-19T13:00:00.000Z" },
+          extra_usage: { is_enabled: true, used_credits: 7.5, monthly_limit: 20 },
+        }),
+    });
+
+    expect(usage.session).toBe(55);
+    expect(usage.weekly).toBe(22);
+    expect(usage.extraSpend).toBe(7.5);
+    expect(usage.extraLimit).toBe(20);
+  });
+
+  it("fetches zai usage with flexible payload parser", async () => {
+    const endpoints: UsageEndpoints = {
+      zai: "https://z.ai/usage",
+      gemini: "",
+      antigravity: "",
+      googleLoadCodeAssistEndpoints: [],
+    };
+
+    const usage = await fetchZaiUsage("token", {
+      endpoints,
+      fetchFn: async () =>
+        jsonResponse(200, {
+          data: {
+            limits: [
+              { type: "TIME_LIMIT", percentage: 20 },
+              { type: "WEEKLY_LIMIT", percentage: 40 },
+            ],
+          },
+        }),
+    });
+
+    expect(usage).toEqual({ session: 20, weekly: 40 });
+
+    const unknown = await fetchZaiUsage("token", {
+      endpoints,
+      fetchFn: async () => jsonResponse(200, { nope: true }),
+    });
+    expect(unknown.error).toBe("unrecognized response shape");
+  });
+
+  it("fetches google usage and falls back to generic parser", async () => {
+    const usage = await fetchGoogleUsage(
+      "token",
+      "https://google-endpoint",
+      "project-123",
+      "gemini",
+      {
+        fetchFn: async (_url) =>
+          jsonResponse(200, {
+            data: { usage: { session: 61, weekly: 72 } },
+          }),
+      },
+    );
+
+    expect(usage).toEqual({ session: 61, weekly: 72 });
+  });
+
+  it("returns explicit error when google project id cannot be discovered", async () => {
+    const usage = await fetchGoogleUsage("token", "https://google-endpoint", undefined, "gemini", {
+      fetchFn: async () => jsonResponse(500, {}),
+      env: {} as any,
+      endpoints: {
+        zai: "",
+        gemini: "https://google-endpoint",
+        antigravity: "",
+        googleLoadCodeAssistEndpoints: ["https://discover"],
+      },
+    });
+
+    expect(usage.error).toBe("missing projectId (try /login again)");
+  });
+
+  it("refreshes expired oauth credentials before usage requests", async () => {
+    const auth: AuthData = {
+      "google-gemini-cli": {
+        access: "expired-token",
+        refresh: "refresh-token",
+        projectId: "proj-a",
+        expires: 1,
+      },
+    };
+
+    const refreshed = await ensureFreshAuthForProviders(["google-gemini-cli"], {
+      auth,
+      nowMs: 10_000,
+      persist: false,
+      oauthResolver: async (providerId) => {
+        expect(providerId).toBe("google-gemini-cli");
+        return {
+          apiKey: "ignored",
+          newCredentials: {
+            access: "fresh-token",
+            refresh: "refresh-token",
+            projectId: "proj-a",
+            expires: 999_999,
+          },
+        };
+      },
+    });
+
+    expect(refreshed.changed).toBe(true);
+    expect(refreshed.refreshErrors["google-gemini-cli"]).toBeUndefined();
+    expect(refreshed.auth?.["google-gemini-cli"]?.access).toBe("fresh-token");
+  });
+
+  it("uses refreshed oauth token in fetchAllUsages", async () => {
+    const auth: AuthData = {
+      "google-gemini-cli": {
+        access: "expired-token",
+        refresh: "refresh-token",
+        projectId: "proj-a",
+        expires: 1,
+      },
+    };
+
+    const all = await fetchAllUsages({
+      auth,
+      env: {} as any,
+      persist: false,
+      oauthResolver: async () => ({
+        apiKey: "ignored",
+        newCredentials: {
+          access: "fresh-token",
+          refresh: "refresh-token",
+          projectId: "proj-a",
+          expires: 999_999,
+        },
+      }),
+      endpoints: {
+        zai: "",
+        gemini: "https://google/quota/gemini",
+        antigravity: "",
+        googleLoadCodeAssistEndpoints: [],
+      },
+      fetchFn: async (_url, init) => {
+        const authHeader = String((init?.headers as any)?.Authorization || "");
+        expect(authHeader).toContain("fresh-token");
+        return jsonResponse(200, {
+          buckets: [{ tokenType: "REQUESTS", modelId: "gemini-pro", remainingFraction: 0.2 }],
+        });
+      },
+    });
+
+    expect(all.gemini).toEqual({ session: 80, weekly: 80 });
+  });
+
+  it("surfaces oauth refresh failures with explicit error", async () => {
+    const auth: AuthData = {
+      "google-antigravity": {
+        access: "expired-token",
+        refresh: "refresh-token",
+        projectId: "proj-b",
+        expires: 1,
+      },
+    };
+
+    const all = await fetchAllUsages({
+      auth,
+      env: {} as any,
+      persist: false,
+      oauthResolver: async () => {
+        throw new Error("refresh boom");
+      },
+      endpoints: {
+        zai: "",
+        gemini: "",
+        antigravity: "https://google/quota/antigravity",
+        googleLoadCodeAssistEndpoints: [],
+      },
+      fetchFn: async () => jsonResponse(200, {}),
+    });
+
+    expect(all.antigravity?.error).toContain("auth refresh failed");
+  });
+
+  it("fetches all available providers in parallel-friendly orchestration", async () => {
+    const auth: AuthData = {
+      "openai-codex": { access: "codex-token" },
+      anthropic: { access: "claude-token" },
+      zai: { key: "zai-key" },
+      "google-gemini-cli": { access: "gemini-token", projectId: "proj-a" },
+      "google-antigravity": { access: "ag-token", projectId: "proj-b" },
+    };
+
+    const endpoints: UsageEndpoints = {
+      zai: "https://z.ai/usage",
+      gemini: "https://google/quota/gemini",
+      antigravity: "https://google/quota/antigravity",
+      googleLoadCodeAssistEndpoints: [],
+    };
+
+    const fetchFn: FetchLike = async (url) => {
+      if (url.includes("chatgpt.com")) {
+        return jsonResponse(200, {
+          rate_limit: {
+            primary_window: { used_percent: 11 },
+            secondary_window: { used_percent: 22 },
+          },
+        });
+      }
+
+      if (url.includes("anthropic")) {
+        return jsonResponse(200, {
+          five_hour: { utilization: 33 },
+          seven_day: { utilization: 44 },
+        });
+      }
+
+      if (url.includes("z.ai")) {
+        return jsonResponse(200, { usage: { session: 55, weekly: 66 } });
+      }
+
+      if (url.includes("gemini")) {
+        return jsonResponse(200, {
+          buckets: [{ tokenType: "REQUESTS", modelId: "gemini-pro", remainingFraction: 0.2 }],
+        });
+      }
+
+      return jsonResponse(200, {
+        buckets: [{ tokenType: "REQUESTS", modelId: "claude-3.7-sonnet", remainingFraction: 0.4 }],
+      });
+    };
+
+    const all = await fetchAllUsages({ auth, endpoints, fetchFn, env: {} as any });
+
+    expect(all.codex).toEqual({ session: 11, weekly: 22, sessionResetsIn: undefined, weeklyResetsIn: undefined });
+    expect(all.claude).toEqual({ session: 33, weekly: 44, sessionResetsIn: undefined, weeklyResetsIn: undefined });
+    expect(all.zai).toEqual({ session: 55, weekly: 66 });
+    expect(all.gemini).toEqual({ session: 80, weekly: 80 });
+    expect(all.antigravity).toEqual({ session: 60, weekly: 60 });
+  });
+});
