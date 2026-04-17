@@ -21,7 +21,7 @@ import {
   colorForPercent,
   detectProvider,
   fetchAllUsages,
-  fetchClaudeUsage,
+  fetchClaudeUsageWithFallback,
   fetchCodexUsage,
   fetchGoogleUsage,
   fetchZaiUsage,
@@ -235,6 +235,10 @@ class UsageSelectorComponent extends Container implements Focusable {
           ),
         );
       }
+
+      if (item.data.warning) {
+        this.listContainer.addChild(new Text(indent + t.fg("warning", `⚠ ${item.data.warning}`), 0, 0));
+      }
     }
 
     this.listContainer.addChild(new Spacer(1));
@@ -373,6 +377,8 @@ export default function (pi: ExtensionAPI) {
 
     const sessionReset = data.sessionResetsIn ? theme.fg("dim", ` ⟳ ${data.sessionResetsIn}`) : "";
     const weeklyReset = data.weeklyResetsIn ? theme.fg("dim", ` ⟳ ${data.weeklyResetsIn}`) : "";
+    const staleSuffix = data.stale ? theme.fg("warning", " stale") : "";
+    const warningSuffix = data.warning && !data.stale ? theme.fg("warning", " ⚠") : "";
 
     const status =
       theme.fg("dim", `${label} `) +
@@ -385,7 +391,9 @@ export default function (pi: ExtensionAPI) {
       renderBar(theme, weekly) +
       " " +
       renderPercent(theme, weekly) +
-      weeklyReset;
+      weeklyReset +
+      staleSuffix +
+      warningSuffix;
 
     ctx.ui.setStatus(STATUS_KEY, status);
   }
@@ -443,9 +451,8 @@ export default function (pi: ExtensionAPI) {
         ? await fetchCodexUsage(access)
         : { session: 0, weekly: 0, error: "missing access token (try /login again)" };
     } else if (active === "claude") {
-      const access = auth.anthropic?.access;
-      state.claude = access
-        ? await fetchClaudeUsage(access)
+      state.claude = auth.anthropic?.access || auth.anthropic?.refresh
+        ? (await fetchClaudeUsageWithFallback({ auth })).usage
         : { session: 0, weekly: 0, error: "missing access token (try /login again)" };
     } else if (active === "zai") {
       const token = auth.zai?.access || auth.zai?.key;

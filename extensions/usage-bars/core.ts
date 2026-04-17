@@ -18,8 +18,13 @@ export interface UsageData {
   weekly: number;
   sessionResetsIn?: string;
   weeklyResetsIn?: string;
+  sessionResetsAt?: string;
+  weeklyResetsAt?: string;
   extraSpend?: number;
   extraLimit?: number;
+  warning?: string;
+  stale?: boolean;
+  fetchedAt?: number;
   error?: string;
 }
 
@@ -32,9 +37,14 @@ export interface UsageEndpoints {
   googleLoadCodeAssistEndpoints: string[];
 }
 
+export interface HeadersLike {
+  get(name: string): string | null;
+}
+
 export interface FetchResponseLike {
   ok: boolean;
   status: number;
+  headers?: HeadersLike;
   json(): Promise<any>;
 }
 
@@ -66,6 +76,7 @@ export interface EnsureFreshAuthConfig {
   oauthResolver?: OAuthApiKeyResolver;
   nowMs?: number;
   persist?: boolean;
+  forceRefreshProviders?: OAuthProviderId[];
 }
 
 export interface FreshAuthResult {
@@ -77,12 +88,67 @@ export interface FreshAuthResult {
 export interface FetchAllUsagesConfig extends FetchConfig, EnsureFreshAuthConfig {
   auth?: AuthData | null;
   authFile?: string;
+  cacheFile?: string;
+}
+
+export interface ClaudeUsageFetchConfig extends RequestConfig, EnsureFreshAuthConfig {
+  auth?: AuthData | null;
+  authFile?: string;
+  cacheFile?: string;
+}
+
+export interface ClaudeUsageFetchResult {
+  usage: UsageData;
+  auth: AuthData | null;
+  changed: boolean;
+}
+
+interface JsonRequestSuccess {
+  ok: true;
+  data: any;
+  status: number;
+  headers?: HeadersLike;
+}
+
+interface JsonRequestError {
+  ok: false;
+  error: string;
+  status: number | null;
+  headers?: HeadersLike;
+}
+
+type JsonRequestResult = JsonRequestSuccess | JsonRequestError;
+
+interface ClaudeUsageAttemptResult {
+  usage: UsageData;
+  status: number | null;
+  retryAfterMs: number | null;
+}
+
+interface ClaudeUsageCacheState {
+  lastSuccess?: UsageData;
+  lastSuccessAt?: number;
+  cooldownUntil?: number;
+  consecutive429s?: number;
+  lastError?: string;
+}
+
+interface UsageBarsCacheFile {
+  version: 1;
+  claude?: ClaudeUsageCacheState;
 }
 
 const DEFAULT_FETCH_TIMEOUT_MS = 12_000;
 const TOKEN_REFRESH_SKEW_MS = 60_000;
+const CLAUDE_SHARED_FRESH_TTL_MS = 2 * 60 * 1000;
+const CLAUDE_BASE_BACKOFF_MS = 2 * 60 * 1000;
+const CLAUDE_MAX_BACKOFF_MS = 30 * 60 * 1000;
+const CLAUDE_LOCK_WAIT_MS = 4_000;
+const CLAUDE_LOCK_POLL_MS = 125;
+const CLAUDE_LOCK_STALE_MS = 20_000;
 
 export const DEFAULT_AUTH_FILE = path.join(os.homedir(), ".pi", "agent", "auth.json");
+export const DEFAULT_USAGE_CACHE_FILE = path.join(os.tmpdir(), "pi", "usage-bars-cache.json");
 export const DEFAULT_ZAI_USAGE_ENDPOINT = "https://api.z.ai/api/monitor/usage/quota/limit";
 export const GOOGLE_QUOTA_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
 export const GOOGLE_LOAD_CODE_ASSIST_ENDPOINTS = [
@@ -90,11 +156,16 @@ export const GOOGLE_LOAD_CODE_ASSIST_ENDPOINTS = [
   "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist",
 ];
 
-export function resolveUsageEndpoints(): UsageEndpoints {
+export function resolveUsageEndpoints(env: NodeJS.ProcessEnv = process.env): UsageEndpoints {
+  const configured = (value: string | undefined, fallback: string) => {
+    const trimmed = value?.trim();
+    return trimmed ? trimmed : fallback;
+  };
+
   return {
-    zai: DEFAULT_ZAI_USAGE_ENDPOINT,
-    gemini: GOOGLE_QUOTA_ENDPOINT,
-    antigravity: GOOGLE_QUOTA_ENDPOINT,
+    zai: configured(env.PI_ZAI_USAGE_ENDPOINT, DEFAULT_ZAI_USAGE_ENDPOINT),
+    gemini: configured(env.PI_GEMINI_USAGE_ENDPOINT, GOOGLE_QUOTA_ENDPOINT),
+    antigravity: configured(env.PI_ANTIGRAVITY_USAGE_ENDPOINT, GOOGLE_QUOTA_ENDPOINT),
     googleLoadCodeAssistEndpoints: GOOGLE_LOAD_CODE_ASSIST_ENDPOINTS,
   };
 }
@@ -120,7 +191,16 @@ function normalizeUsagePair(session: number, weekly: number): { session: number;
   return { session: clean(session), weekly: clean(weekly) };
 }
 
-async function requestJson(url: string, init: RequestInit, config: RequestConfig = {}): Promise<{ ok: true; data: any } | { ok: false; error: string }> {
+function getHeader(headers: HeadersLike | undefined, name: string): string | null {
+  if (!headers) return null;
+  try {
+    return headers.get(name);
+  } catch {
+    return null;
+  }
+}
+
+async function requestJson(url: string, init: RequestInit, config: RequestConfig = {}): Promise<JsonRequestResult> {
   const fetchFn = config.fetchFn ?? ((fetch as unknown) as FetchLike);
   const timeoutMs = config.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
   const controller = new AbortController();
@@ -128,16 +208,18 @@ async function requestJson(url: string, init: RequestInit, config: RequestConfig
 
   try {
     const response = await fetchFn(url, { ...init, signal: controller.signal });
-    if (!response.ok) return { ok: false, error: `HTTP ${response.status}` };
+    if (!response.ok) {
+      return { ok: false, error: `HTTP ${response.status}`, status: response.status, headers: response.headers };
+    }
 
     try {
       const data = await response.json();
-      return { ok: true, data };
+      return { ok: true, data, status: response.status, headers: response.headers };
     } catch {
-      return { ok: false, error: "invalid JSON response" };
+      return { ok: false, error: "invalid JSON response", status: response.status, headers: response.headers };
     }
   } catch (error) {
-    return { ok: false, error: toErrorMessage(error) };
+    return { ok: false, error: toErrorMessage(error), status: null };
   } finally {
     if (timeout) clearTimeout(timeout);
   }
@@ -163,6 +245,19 @@ export function formatResetsAt(isoDate: string, nowMs = Date.now()): string {
   return formatDuration(diffSeconds);
 }
 
+export function parseRetryAfterMs(value: string | null | undefined, nowMs = Date.now()): number | null {
+  if (!value) return null;
+
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric >= 0) {
+    return numeric * 1000;
+  }
+
+  const dateMs = new Date(value).getTime();
+  if (!Number.isFinite(dateMs)) return null;
+  return Math.max(0, dateMs - nowMs);
+}
+
 export function readAuth(authFile = DEFAULT_AUTH_FILE): AuthData | null {
   try {
     const parsed = JSON.parse(fs.readFileSync(authFile, "utf-8"));
@@ -184,6 +279,79 @@ export function writeAuth(auth: AuthData, authFile = DEFAULT_AUTH_FILE): boolean
   } catch {
     return false;
   }
+}
+
+function readUsageCache(cacheFile = DEFAULT_USAGE_CACHE_FILE): UsageBarsCacheFile {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(cacheFile, "utf-8"));
+    if (parsed?.version === 1 && typeof parsed === "object") {
+      return parsed as UsageBarsCacheFile;
+    }
+  } catch {
+    // Ignore invalid or missing cache.
+  }
+  return { version: 1 };
+}
+
+function writeUsageCache(cache: UsageBarsCacheFile, cacheFile = DEFAULT_USAGE_CACHE_FILE): boolean {
+  try {
+    const dir = path.dirname(cacheFile);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    const tmpPath = `${cacheFile}.tmp-${process.pid}-${Date.now()}`;
+    fs.writeFileSync(tmpPath, JSON.stringify(cache, null, 2));
+    fs.renameSync(tmpPath, cacheFile);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function ensureParentDir(filePath: string) {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+function safeUnlink(filePath: string) {
+  try {
+    fs.unlinkSync(filePath);
+  } catch {
+    // Ignore races.
+  }
+}
+
+async function acquireFileLock(lockFile: string): Promise<(() => void) | null> {
+  ensureParentDir(lockFile);
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt <= CLAUDE_LOCK_WAIT_MS) {
+    try {
+      const fd = fs.openSync(lockFile, "wx");
+      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
+      fs.closeSync(fd);
+      return () => safeUnlink(lockFile);
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") return null;
+
+      try {
+        const stat = fs.statSync(lockFile);
+        if (Date.now() - stat.mtimeMs >= CLAUDE_LOCK_STALE_MS) {
+          safeUnlink(lockFile);
+          continue;
+        }
+      } catch {
+        continue;
+      }
+
+      await sleep(CLAUDE_LOCK_POLL_MS);
+    }
+  }
+
+  return null;
 }
 
 let cachedOAuthResolver: OAuthApiKeyResolver | null = null;
@@ -220,6 +388,7 @@ export async function ensureFreshAuthForProviders(
 
   const nowMs = config.nowMs ?? Date.now();
   const uniqueProviders = Array.from(new Set(providerIds));
+  const forcedProviders = new Set(config.forceRefreshProviders ?? []);
   const nextAuth: AuthData = { ...auth };
   const refreshErrors: Partial<Record<OAuthProviderId, string>> = {};
 
@@ -229,7 +398,7 @@ export async function ensureFreshAuthForProviders(
     const creds = (nextAuth as any)[providerId] as { access?: string; refresh?: string; expires?: number } | undefined;
     if (!creds?.refresh) continue;
 
-    const needsRefresh = !creds.access || isCredentialExpired(creds, nowMs);
+    const needsRefresh = forcedProviders.has(providerId) || !creds.access || isCredentialExpired(creds, nowMs);
     if (!needsRefresh) continue;
 
     try {
@@ -377,7 +546,7 @@ export async function discoverGoogleProjectId(token: string, config: FetchConfig
   const envProjectId = env.GOOGLE_CLOUD_PROJECT || env.GOOGLE_CLOUD_PROJECT_ID;
   if (envProjectId) return envProjectId;
 
-  const endpoints = config.endpoints ?? resolveUsageEndpoints();
+  const endpoints = config.endpoints ?? resolveUsageEndpoints(env);
 
   for (const endpoint of endpoints.googleLoadCodeAssistEndpoints) {
     const result = await requestJson(
@@ -451,6 +620,85 @@ export function parseGoogleQuotaBuckets(data: any, provider: "gemini" | "antigra
   return normalizeUsagePair(session, weekly);
 }
 
+function hydrateUsageResets(usage: UsageData, nowMs = Date.now()): UsageData {
+  return {
+    ...usage,
+    sessionResetsIn: usage.sessionResetsAt ? formatResetsAt(usage.sessionResetsAt, nowMs) : usage.sessionResetsIn,
+    weeklyResetsIn: usage.weeklyResetsAt ? formatResetsAt(usage.weeklyResetsAt, nowMs) : usage.weeklyResetsIn,
+  };
+}
+
+function snapshotUsage(usage: UsageData, nowMs = Date.now()): UsageData {
+  return {
+    session: usage.session,
+    weekly: usage.weekly,
+    sessionResetsAt: usage.sessionResetsAt,
+    weeklyResetsAt: usage.weeklyResetsAt,
+    sessionResetsIn: usage.sessionResetsIn,
+    weeklyResetsIn: usage.weeklyResetsIn,
+    extraSpend: usage.extraSpend,
+    extraLimit: usage.extraLimit,
+    fetchedAt: usage.fetchedAt ?? nowMs,
+  };
+}
+
+function staleCachedUsage(cached: UsageData, warning: string, nowMs = Date.now()): UsageData {
+  return {
+    ...hydrateUsageResets(snapshotUsage(cached, nowMs), nowMs),
+    stale: true,
+    warning,
+  };
+}
+
+function readClaudeCacheState(cacheFile = DEFAULT_USAGE_CACHE_FILE): ClaudeUsageCacheState {
+  return readUsageCache(cacheFile).claude ?? {};
+}
+
+function writeClaudeCacheState(state: ClaudeUsageCacheState, cacheFile = DEFAULT_USAGE_CACHE_FILE): boolean {
+  const cache = readUsageCache(cacheFile);
+  cache.claude = state;
+  return writeUsageCache(cache, cacheFile);
+}
+
+function clearClaudeCooldown(state: ClaudeUsageCacheState): ClaudeUsageCacheState {
+  return {
+    ...state,
+    cooldownUntil: undefined,
+    consecutive429s: 0,
+    lastError: undefined,
+  };
+}
+
+function computeClaudeBackoffMs(state: ClaudeUsageCacheState, retryAfterMs: number | null): number {
+  if (retryAfterMs != null && retryAfterMs > 0) {
+    return Math.min(CLAUDE_MAX_BACKOFF_MS, Math.max(CLAUDE_BASE_BACKOFF_MS, retryAfterMs));
+  }
+
+  const consecutive429s = Math.max(1, state.consecutive429s ?? 0);
+  const exponential = CLAUDE_BASE_BACKOFF_MS * Math.pow(2, Math.max(0, consecutive429s - 1));
+  return Math.min(CLAUDE_MAX_BACKOFF_MS, exponential);
+}
+
+function cooldownMessage(untilMs: number, nowMs = Date.now()): string {
+  return `rate limited; retry in ${formatDuration(Math.max(0, untilMs - nowMs) / 1000)}`;
+}
+
+function readClaudeCacheOutcome(cacheFile = DEFAULT_USAGE_CACHE_FILE, nowMs = Date.now()): UsageData | null {
+  const state = readClaudeCacheState(cacheFile);
+
+  if (state.cooldownUntil && state.cooldownUntil > nowMs) {
+    const warning = cooldownMessage(state.cooldownUntil, nowMs);
+    if (state.lastSuccess) return staleCachedUsage(state.lastSuccess, warning, nowMs);
+    return { session: 0, weekly: 0, error: warning };
+  }
+
+  if (state.lastSuccess && state.lastSuccessAt && nowMs - state.lastSuccessAt <= CLAUDE_SHARED_FRESH_TTL_MS) {
+    return hydrateUsageResets(snapshotUsage(state.lastSuccess, state.lastSuccessAt), nowMs);
+  }
+
+  return null;
+}
+
 export async function fetchCodexUsage(token: string, config: RequestConfig = {}): Promise<UsageData> {
   const result = await requestJson(
     "https://chatgpt.com/backend-api/wham/usage",
@@ -471,7 +719,11 @@ export async function fetchCodexUsage(token: string, config: RequestConfig = {})
   };
 }
 
-export async function fetchClaudeUsage(token: string, config: RequestConfig = {}): Promise<UsageData> {
+async function fetchClaudeUsageAttempt(
+  token: string,
+  config: RequestConfig = {},
+  nowMs = Date.now(),
+): Promise<ClaudeUsageAttemptResult> {
   const result = await requestJson(
     "https://api.anthropic.com/api/oauth/usage",
     {
@@ -483,27 +735,217 @@ export async function fetchClaudeUsage(token: string, config: RequestConfig = {}
     config,
   );
 
-  if (!result.ok) return { session: 0, weekly: 0, error: result.error };
+  const retryAfterMs = parseRetryAfterMs(getHeader(result.headers, "retry-after"), nowMs);
+
+  if (!result.ok) {
+    return {
+      usage: { session: 0, weekly: 0, error: result.error },
+      status: result.status,
+      retryAfterMs,
+    };
+  }
 
   const data = result.data;
-  const usage: UsageData = {
-    session: readPercentCandidate(data?.five_hour?.utilization) ?? 0,
-    weekly: readPercentCandidate(data?.seven_day?.utilization) ?? 0,
-    sessionResetsIn: data?.five_hour?.resets_at ? formatResetsAt(data.five_hour.resets_at) : undefined,
-    weeklyResetsIn: data?.seven_day?.resets_at ? formatResetsAt(data.seven_day.resets_at) : undefined,
-  };
+  const usage: UsageData = hydrateUsageResets(
+    {
+      session: readPercentCandidate(data?.five_hour?.utilization) ?? 0,
+      weekly: readPercentCandidate(data?.seven_day?.utilization) ?? 0,
+      sessionResetsAt: typeof data?.five_hour?.resets_at === "string" ? data.five_hour.resets_at : undefined,
+      weeklyResetsAt: typeof data?.seven_day?.resets_at === "string" ? data.seven_day.resets_at : undefined,
+      fetchedAt: nowMs,
+    },
+    nowMs,
+  );
 
   if (data?.extra_usage?.is_enabled) {
     usage.extraSpend = typeof data.extra_usage.used_credits === "number" ? data.extra_usage.used_credits : undefined;
     usage.extraLimit = typeof data.extra_usage.monthly_limit === "number" ? data.extra_usage.monthly_limit : undefined;
   }
 
-  return usage;
+  return { usage, status: result.status, retryAfterMs };
+}
+
+export async function fetchClaudeUsage(token: string, config: RequestConfig = {}): Promise<UsageData> {
+  return (await fetchClaudeUsageAttempt(token, config)).usage;
+}
+
+export async function fetchClaudeUsageWithFallback(
+  config: ClaudeUsageFetchConfig = {},
+): Promise<ClaudeUsageFetchResult> {
+  const authFile = config.authFile ?? DEFAULT_AUTH_FILE;
+  const cacheFile = config.cacheFile ?? DEFAULT_USAGE_CACHE_FILE;
+  const lockFile = `${cacheFile}.claude.lock`;
+  const nowMs = config.nowMs ?? Date.now();
+
+  let auth = config.auth ?? readAuth(authFile);
+  if (!auth) {
+    return {
+      auth: null,
+      changed: false,
+      usage: { session: 0, weekly: 0, error: "missing access token (try /login again)" },
+    };
+  }
+
+  let changed = false;
+  const initialRefresh = await ensureFreshAuthForProviders(["anthropic"], {
+    ...config,
+    auth,
+    authFile,
+    nowMs,
+  });
+  auth = initialRefresh.auth ?? auth;
+  changed = initialRefresh.changed;
+
+  const initialRefreshError = initialRefresh.refreshErrors.anthropic;
+  if (initialRefreshError) {
+    return {
+      auth,
+      changed,
+      usage: { session: 0, weekly: 0, error: `auth refresh failed (${initialRefreshError})` },
+    };
+  }
+
+  const cachedOutcome = readClaudeCacheOutcome(cacheFile, nowMs);
+  if (cachedOutcome) {
+    return { auth, changed, usage: cachedOutcome };
+  }
+
+  const token = auth.anthropic?.access;
+  if (!token) {
+    return {
+      auth,
+      changed,
+      usage: { session: 0, weekly: 0, error: "missing access token (try /login again)" },
+    };
+  }
+
+  const releaseLock = await acquireFileLock(lockFile);
+  if (!releaseLock) {
+    const waitedOutcome = readClaudeCacheOutcome(cacheFile, nowMs);
+    if (waitedOutcome) return { auth, changed, usage: waitedOutcome };
+  }
+
+  try {
+    const lockOutcome = readClaudeCacheOutcome(cacheFile, nowMs);
+    if (lockOutcome) return { auth, changed, usage: lockOutcome };
+
+    let state = readClaudeCacheState(cacheFile);
+    let attempt = await fetchClaudeUsageAttempt(token, config, nowMs);
+    let refreshError: string | undefined;
+
+    if (attempt.status === 429 && auth.anthropic?.refresh) {
+      const forcedRefresh = await ensureFreshAuthForProviders(["anthropic"], {
+        ...config,
+        auth,
+        authFile,
+        nowMs,
+        forceRefreshProviders: ["anthropic"],
+      });
+
+      auth = forcedRefresh.auth ?? auth;
+      changed = changed || forcedRefresh.changed;
+      refreshError = forcedRefresh.refreshErrors.anthropic;
+
+      if (!refreshError && auth.anthropic?.access) {
+        attempt = await fetchClaudeUsageAttempt(auth.anthropic.access, config, nowMs);
+      }
+    }
+
+    if (!attempt.usage.error) {
+      state = clearClaudeCooldown(state);
+      state.lastSuccess = snapshotUsage(attempt.usage, nowMs);
+      state.lastSuccessAt = nowMs;
+      writeClaudeCacheState(state, cacheFile);
+      return { auth, changed, usage: attempt.usage };
+    }
+
+    if (attempt.status === 429) {
+      const consecutive429s = Math.max(1, (state.consecutive429s ?? 0) + 1);
+      const backoffMs = computeClaudeBackoffMs({ ...state, consecutive429s }, attempt.retryAfterMs);
+      const cooldownUntil = nowMs + backoffMs;
+      const details = refreshError ? `; auth refresh failed (${refreshError})` : "";
+
+      state = {
+        ...state,
+        cooldownUntil,
+        consecutive429s,
+        lastError: `${attempt.usage.error}${details}`,
+      };
+      writeClaudeCacheState(state, cacheFile);
+
+      if (state.lastSuccess) {
+        return {
+          auth,
+          changed,
+          usage: staleCachedUsage(state.lastSuccess, `${cooldownMessage(cooldownUntil, nowMs)}${details}`, nowMs),
+        };
+      }
+
+      return {
+        auth,
+        changed,
+        usage: {
+          session: 0,
+          weekly: 0,
+          error: `${attempt.usage.error}; ${cooldownMessage(cooldownUntil, nowMs)}${details}`,
+        },
+      };
+    }
+
+    return { auth, changed, usage: attempt.usage };
+  } finally {
+    releaseLock?.();
+  }
+}
+
+/**
+ * Parse z.ai-specific response where both session and weekly are TOKENS_LIMIT
+ * entries differentiated by the `unit` field:
+ *   unit 3 = 5-hour rolling window (session)
+ *   unit 6 = 7-day rolling window (weekly)
+ *   unit 5 = monthly web search quota (ignored for usage bars)
+ *
+ * Credit: Arthur Bodera (@Thinkscape)
+ */
+export function extractZaiUsageFromPayload(data: any, nowMs = Date.now()): UsageData | null {
+  const limitsArrays = [data?.data?.limits, data?.limits, data?.quota?.limits, data?.data?.quota?.limits];
+  const limits = limitsArrays.find((arr) => Array.isArray(arr)) as any[] | undefined;
+  if (!limits?.length) return null;
+
+  const tokensLimits = limits.filter((l: any) => String(l?.type || "").toUpperCase() === "TOKENS_LIMIT");
+
+  // unit 3 = 5-hour session window
+  const sessionEntry = tokensLimits.find((l: any) => l?.unit === 3);
+  // unit 6 = 7-day weekly window
+  const weeklyEntry = tokensLimits.find((l: any) => l?.unit === 6);
+
+  if (!sessionEntry || !weeklyEntry) return null;
+
+  const sessionPct = readPercentCandidate(sessionEntry.percentage);
+  const weeklyPct = readPercentCandidate(weeklyEntry.percentage);
+
+  if (sessionPct == null || weeklyPct == null) return null;
+
+  const parsed = normalizeUsagePair(sessionPct, weeklyPct);
+
+  const sessionReset = typeof sessionEntry.nextResetTime === "number" && sessionEntry.nextResetTime > 0
+    ? formatDuration(Math.max(0, (sessionEntry.nextResetTime - nowMs) / 1000))
+    : undefined;
+  const weeklyReset = typeof weeklyEntry.nextResetTime === "number" && weeklyEntry.nextResetTime > 0
+    ? formatDuration(Math.max(0, (weeklyEntry.nextResetTime - nowMs) / 1000))
+    : undefined;
+
+  return {
+    session: parsed.session,
+    weekly: parsed.weekly,
+    sessionResetsIn: sessionReset,
+    weeklyResetsIn: weeklyReset,
+  };
 }
 
 export async function fetchZaiUsage(token: string, config: FetchConfig = {}): Promise<UsageData> {
-  const endpoint = (config.endpoints ?? resolveUsageEndpoints()).zai;
-  if (!endpoint) return { session: 0, weekly: 0, error: "usage endpoint unavailable" };
+  const endpoint = (config.endpoints ?? resolveUsageEndpoints(config.env)).zai;
+  if (!endpoint) return { session: 0, weekly: 0, error: "configure PI_ZAI_USAGE_ENDPOINT" };
 
   const result = await requestJson(
     endpoint,
@@ -513,6 +955,11 @@ export async function fetchZaiUsage(token: string, config: FetchConfig = {}): Pr
 
   if (!result.ok) return { session: 0, weekly: 0, error: result.error };
 
+  // Try z.ai-specific parser first (handles TOKENS_LIMIT with unit field)
+  const zaiParsed = extractZaiUsageFromPayload(result.data);
+  if (zaiParsed) return zaiParsed;
+
+  // Fallback to generic parser
   const parsed = extractUsageFromPayload(result.data);
   if (!parsed) return { session: 0, weekly: 0, error: "unrecognized response shape" };
   return parsed;
@@ -605,7 +1052,7 @@ export function colorForPercent(value: number): "success" | "warning" | "error" 
 export async function fetchAllUsages(config: FetchAllUsagesConfig = {}): Promise<UsageByProvider> {
   const authFile = config.authFile ?? DEFAULT_AUTH_FILE;
   const auth = config.auth ?? readAuth(authFile);
-  const endpoints = config.endpoints ?? resolveUsageEndpoints();
+  const endpoints = config.endpoints ?? resolveUsageEndpoints(config.env);
 
   const results: UsageByProvider = {
     codex: null,
@@ -656,10 +1103,20 @@ export async function fetchAllUsages(config: FetchAllUsagesConfig = {}): Promise
     else assign("codex", fetchCodexUsage(authData["openai-codex"].access, config));
   }
 
-  if (authData.anthropic?.access) {
+  if (authData.anthropic?.access || authData.anthropic?.refresh) {
     const err = refreshError("anthropic");
-    if (err) results.claude = { session: 0, weekly: 0, error: err };
-    else assign("claude", fetchClaudeUsage(authData.anthropic.access, config));
+    if (err) {
+      results.claude = { session: 0, weekly: 0, error: err };
+    } else {
+      assign(
+        "claude",
+        fetchClaudeUsageWithFallback({
+          ...config,
+          auth: authData,
+          authFile,
+        }).then((result) => result.usage),
+      );
+    }
   }
 
   if (authData.zai?.access || authData.zai?.key) {

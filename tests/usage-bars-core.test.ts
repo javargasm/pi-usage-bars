@@ -1,18 +1,24 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   canShowForProvider,
   detectProvider,
   discoverGoogleProjectId,
   ensureFreshAuthForProviders,
   extractUsageFromPayload,
+  extractZaiUsageFromPayload,
   fetchAllUsages,
   fetchClaudeUsage,
+  fetchClaudeUsageWithFallback,
   fetchCodexUsage,
   fetchGoogleUsage,
   fetchZaiUsage,
   formatDuration,
   formatResetsAt,
   parseGoogleQuotaBuckets,
+  parseRetryAfterMs,
   pickMostUsedBucket,
   readLimitPercent,
   readPercentCandidate,
@@ -24,10 +30,20 @@ import {
   type UsageEndpoints,
 } from "../extensions/usage-bars/core";
 
-function jsonResponse(status: number, body: any): FetchResponseLike {
+function responseHeaders(values: Record<string, string> = {}) {
+  const normalized = new Map(Object.entries(values).map(([key, value]) => [key.toLowerCase(), value]));
+  return {
+    get(name: string) {
+      return normalized.get(name.toLowerCase()) ?? null;
+    },
+  };
+}
+
+function jsonResponse(status: number, body: any, headers: Record<string, string> = {}): FetchResponseLike {
   return {
     ok: status >= 200 && status < 300,
     status,
+    headers: responseHeaders(headers),
     json: async () => body,
   };
 }
@@ -36,10 +52,16 @@ function invalidJsonResponse(status = 200): FetchResponseLike {
   return {
     ok: status >= 200 && status < 300,
     status,
+    headers: responseHeaders(),
     json: async () => {
       throw new Error("bad json");
     },
   };
+}
+
+function tempFile(name: string): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "usage-bars-"));
+  return path.join(dir, name);
 }
 
 describe("usage-bars-core formatting", () => {
@@ -56,6 +78,13 @@ describe("usage-bars-core formatting", () => {
     expect(formatResetsAt("2026-02-18T13:30:00.000Z", now)).toBe("1h 30m");
     expect(formatResetsAt("not-a-date", now)).toBe("");
     expect(formatResetsAt("2026-02-18T11:00:00.000Z", now)).toBe("now");
+  });
+
+  it("parses retry-after seconds and dates", () => {
+    const now = Date.parse("2026-02-18T12:00:00.000Z");
+    expect(parseRetryAfterMs("120", now)).toBe(120000);
+    expect(parseRetryAfterMs("2026-02-18T12:05:00.000Z", now)).toBe(300000);
+    expect(parseRetryAfterMs("bad-value", now)).toBeNull();
   });
 });
 
@@ -191,7 +220,7 @@ describe("usage-bars-core network fetchers", () => {
     const id = await discoverGoogleProjectId("token", {
       fetchFn,
       env: { GOOGLE_CLOUD_PROJECT: "proj-from-env" } as any,
-      endpoints: resolveUsageEndpoints(),
+      endpoints: resolveUsageEndpoints({} as any),
     });
 
     expect(id).toBe("proj-from-env");
@@ -260,9 +289,231 @@ describe("usage-bars-core network fetchers", () => {
     expect(usage.weekly).toBe(22);
     expect(usage.extraSpend).toBe(7.5);
     expect(usage.extraLimit).toBe(20);
+    expect(usage.sessionResetsAt).toBe("2026-02-18T13:00:00.000Z");
   });
 
-  it("fetches zai usage with flexible payload parser", async () => {
+  it("refreshes claude oauth token after a 429 and retries once", async () => {
+    const auth: AuthData = {
+      anthropic: {
+        access: "stale-token",
+        refresh: "refresh-token",
+        expires: 9999999999999,
+      },
+    };
+
+    const cacheFile = tempFile("usage-cache.json");
+    const authFile = tempFile("auth.json");
+    const tokensSeen: string[] = [];
+
+    const result = await fetchClaudeUsageWithFallback({
+      auth,
+      authFile,
+      cacheFile,
+      persist: false,
+      nowMs: Date.parse("2026-02-18T12:00:00.000Z"),
+      oauthResolver: async () => ({
+        apiKey: "ignored",
+        newCredentials: {
+          access: "fresh-token",
+          refresh: "refresh-token-2",
+          expires: 9999999999999,
+        },
+      }),
+      fetchFn: async (_url, init) => {
+        const token = String((init?.headers as any)?.Authorization || "").replace("Bearer ", "");
+        tokensSeen.push(token);
+
+        if (token === "stale-token") {
+          return jsonResponse(429, { error: true }, { "retry-after": "0" });
+        }
+
+        return jsonResponse(200, {
+          five_hour: { utilization: 61, resets_at: "2026-02-18T14:00:00.000Z" },
+          seven_day: { utilization: 19, resets_at: "2026-02-20T12:00:00.000Z" },
+        });
+      },
+    });
+
+    expect(tokensSeen).toEqual(["stale-token", "fresh-token"]);
+    expect(result.auth?.anthropic?.access).toBe("fresh-token");
+    expect(result.usage).toMatchObject({ session: 61, weekly: 19 });
+    expect(result.usage.error).toBeUndefined();
+  });
+
+  it("returns stale cached claude usage during 429 cooldown", async () => {
+    const auth: AuthData = {
+      anthropic: {
+        access: "claude-token",
+        refresh: "refresh-token",
+        expires: 9999999999999,
+      },
+    };
+
+    const cacheFile = tempFile("usage-cache.json");
+    const authFile = tempFile("auth.json");
+
+    const first = await fetchClaudeUsageWithFallback({
+      auth,
+      authFile,
+      cacheFile,
+      persist: false,
+      nowMs: Date.parse("2026-02-18T12:00:00.000Z"),
+      fetchFn: async () =>
+        jsonResponse(200, {
+          five_hour: { utilization: 45, resets_at: "2026-02-18T13:00:00.000Z" },
+          seven_day: { utilization: 12, resets_at: "2026-02-20T12:00:00.000Z" },
+        }),
+    });
+
+    expect(first.usage).toMatchObject({ session: 45, weekly: 12 });
+
+    const second = await fetchClaudeUsageWithFallback({
+      auth,
+      authFile,
+      cacheFile,
+      persist: false,
+      nowMs: Date.parse("2026-02-18T12:10:00.000Z"),
+      oauthResolver: async () => ({
+        apiKey: "ignored",
+        newCredentials: {
+          access: "refreshed-token",
+          refresh: "refresh-token-2",
+          expires: 9999999999999,
+        },
+      }),
+      fetchFn: async () => jsonResponse(429, { error: true }, { "retry-after": "0" }),
+    });
+
+    expect(second.usage.session).toBe(45);
+    expect(second.usage.weekly).toBe(12);
+    expect(second.usage.stale).toBe(true);
+    expect(second.usage.warning).toContain("retry in");
+    expect(second.usage.error).toBeUndefined();
+  });
+
+  it("reuses recent claude cache across concurrent callers", async () => {
+    const auth: AuthData = {
+      anthropic: {
+        access: "claude-token",
+        refresh: "refresh-token",
+        expires: 9999999999999,
+      },
+    };
+
+    const cacheFile = tempFile("usage-cache.json");
+    const authFile = tempFile("auth.json");
+    let calls = 0;
+
+    const fetchFn: FetchLike = async () => {
+      calls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 75));
+      return jsonResponse(200, {
+        five_hour: { utilization: 52, resets_at: "2026-02-18T13:00:00.000Z" },
+        seven_day: { utilization: 28, resets_at: "2026-02-20T12:00:00.000Z" },
+      });
+    };
+
+    const [one, two] = await Promise.all([
+      fetchClaudeUsageWithFallback({
+        auth,
+        authFile,
+        cacheFile,
+        persist: false,
+        nowMs: Date.parse("2026-02-18T12:00:00.000Z"),
+        fetchFn,
+      }),
+      fetchClaudeUsageWithFallback({
+        auth,
+        authFile,
+        cacheFile,
+        persist: false,
+        nowMs: Date.parse("2026-02-18T12:00:00.000Z"),
+        fetchFn,
+      }),
+    ]);
+
+    expect(calls).toBe(1);
+    expect(one.usage).toMatchObject({ session: 52, weekly: 28 });
+    expect(two.usage).toMatchObject({ session: 52, weekly: 28 });
+  });
+
+  it("parses z.ai payload with TOKENS_LIMIT differentiated by unit field", () => {
+    const now = Date.now();
+    const payload = {
+      code: 200,
+      data: {
+        limits: [
+          {
+            type: "TOKENS_LIMIT",
+            unit: 3,
+            number: 5,
+            percentage: 29,
+            nextResetTime: now + 5 * 60 * 60 * 1000,
+          },
+          {
+            type: "TOKENS_LIMIT",
+            unit: 6,
+            number: 1,
+            percentage: 5,
+            nextResetTime: now + 7 * 24 * 60 * 60 * 1000,
+          },
+          {
+            type: "TIME_LIMIT",
+            unit: 5,
+            number: 1,
+            percentage: 0,
+          },
+        ],
+      },
+    };
+
+    const parsed = extractZaiUsageFromPayload(payload, now);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.session).toBe(29);
+    expect(parsed!.weekly).toBe(5);
+    expect(parsed!.sessionResetsIn).toBeDefined();
+    expect(parsed!.weeklyResetsIn).toBeDefined();
+  });
+
+  it("extractZaiUsageFromPayload returns null when no unit 3 or 6 TOKENS_LIMIT", () => {
+    const payload = {
+      data: {
+        limits: [
+          { type: "TIME_LIMIT", unit: 5, percentage: 50 },
+        ],
+      },
+    };
+    expect(extractZaiUsageFromPayload(payload)).toBeNull();
+  });
+
+  it("fetches zai usage with z.ai-specific TOKENS_LIMIT by unit", async () => {
+    const endpoints: UsageEndpoints = {
+      zai: "https://z.ai/usage",
+      gemini: "",
+      antigravity: "",
+      googleLoadCodeAssistEndpoints: [],
+    };
+
+    const usage = await fetchZaiUsage("token", {
+      endpoints,
+      fetchFn: async () =>
+        jsonResponse(200, {
+          data: {
+            limits: [
+              { type: "TOKENS_LIMIT", unit: 3, percentage: 29 },
+              { type: "TOKENS_LIMIT", unit: 6, percentage: 5 },
+              { type: "TIME_LIMIT", unit: 5, percentage: 0 },
+            ],
+          },
+        }),
+    });
+
+    expect(usage.session).toBe(29);
+    expect(usage.weekly).toBe(5);
+    expect(usage.error).toBeUndefined();
+  });
+
+  it("fetches zai usage falls back to generic parser when no unit-based limits", async () => {
     const endpoints: UsageEndpoints = {
       zai: "https://z.ai/usage",
       gemini: "",
@@ -277,13 +528,23 @@ describe("usage-bars-core network fetchers", () => {
           data: {
             limits: [
               { type: "TIME_LIMIT", percentage: 20 },
-              { type: "WEEKLY_LIMIT", percentage: 40 },
+              { type: "TOKENS_LIMIT", percentage: 40 },
             ],
           },
         }),
     });
 
-    expect(usage).toEqual({ session: 20, weekly: 40 });
+    expect(usage.session).toBe(20);
+    expect(usage.weekly).toBe(40);
+  });
+
+  it("fetches zai usage returns error for unrecognized shapes", async () => {
+    const endpoints: UsageEndpoints = {
+      zai: "https://z.ai/usage",
+      gemini: "",
+      antigravity: "",
+      googleLoadCodeAssistEndpoints: [],
+    };
 
     const unknown = await fetchZaiUsage("token", {
       endpoints,
@@ -475,10 +736,10 @@ describe("usage-bars-core network fetchers", () => {
       });
     };
 
-    const all = await fetchAllUsages({ auth, endpoints, fetchFn, env: {} as any });
+    const all = await fetchAllUsages({ auth, endpoints, fetchFn, env: {} as any, cacheFile: tempFile("all-usage-cache.json") });
 
     expect(all.codex).toEqual({ session: 11, weekly: 22, sessionResetsIn: undefined, weeklyResetsIn: undefined });
-    expect(all.claude).toEqual({ session: 33, weekly: 44, sessionResetsIn: undefined, weeklyResetsIn: undefined });
+    expect(all.claude).toMatchObject({ session: 33, weekly: 44, sessionResetsIn: undefined, weeklyResetsIn: undefined });
     expect(all.zai).toEqual({ session: 55, weekly: 66 });
     expect(all.gemini).toEqual({ session: 80, weekly: 80 });
     expect(all.antigravity).toEqual({ session: 60, weekly: 60 });
