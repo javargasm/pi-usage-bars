@@ -12,7 +12,7 @@ import {
   Input,
   Spacer,
   Text,
-  getEditorKeybindings,
+  getKeybindings,
   type Focusable,
 } from "@mariozechner/pi-tui";
 import {
@@ -263,9 +263,9 @@ class UsageSelectorComponent extends Container implements Focusable {
   }
 
   handleInput(keyData: string): void {
-    const kb = getEditorKeybindings();
+    const kb = getKeybindings();
 
-    if (kb.matches(keyData, "selectUp")) {
+    if (kb.matches(keyData, "tui.select.up")) {
       if (this.filteredItems.length === 0) return;
       this.selectedIndex =
         this.selectedIndex === 0 ? this.filteredItems.length - 1 : this.selectedIndex - 1;
@@ -273,7 +273,7 @@ class UsageSelectorComponent extends Container implements Focusable {
       return;
     }
 
-    if (kb.matches(keyData, "selectDown")) {
+    if (kb.matches(keyData, "tui.select.down")) {
       if (this.filteredItems.length === 0) return;
       this.selectedIndex =
         this.selectedIndex === this.filteredItems.length - 1 ? 0 : this.selectedIndex + 1;
@@ -281,7 +281,7 @@ class UsageSelectorComponent extends Container implements Focusable {
       return;
     }
 
-    if (kb.matches(keyData, "selectCancel") || kb.matches(keyData, "selectConfirm")) {
+    if (kb.matches(keyData, "tui.select.cancel") || kb.matches(keyData, "tui.select.confirm")) {
       this.onCancelCallback();
       return;
     }
