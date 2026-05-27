@@ -15,6 +15,8 @@ import {
   fetchCodexUsage,
   fetchGoogleUsage,
   fetchZaiUsage,
+  fetchOpencodeGoUsage,
+  resolveOpencodeGoConfig,
   formatDuration,
   formatResetsAt,
   parseGoogleQuotaBuckets,
@@ -206,6 +208,8 @@ describe("usage-bars-core provider detection and visibility", () => {
     expect(canShowForProvider("codex", auth, endpoints)).toBe(true);
     expect(canShowForProvider("antigravity", auth, endpoints)).toBe(false);
     expect(canShowForProvider("zai", auth, { ...endpoints, zai: "" })).toBe(false);
+    expect(canShowForProvider("opencode-go", auth, endpoints)).toBe(false);
+    expect(canShowForProvider("opencode-go", { ...auth, "opencode-go": { key: "e" } }, endpoints)).toBe(true);
   });
 });
 
@@ -273,6 +277,26 @@ describe("usage-bars-core network fetchers", () => {
 
     const badJson = await fetchCodexUsage("token", { fetchFn: async () => invalidJsonResponse() });
     expect(badJson.error).toBe("invalid JSON response");
+  });
+
+  it("fetches codex usage with accountId and sends it in headers", async () => {
+    let headersSeen: any = null;
+    const ok = await fetchCodexUsage("token", "account-123", {
+      fetchFn: async (_url, init) => {
+        headersSeen = init?.headers;
+        return jsonResponse(200, {
+          rate_limit: {
+            primary_window: { used_percent: 42, reset_after_seconds: 120 },
+            secondary_window: { used_percent: 73, reset_after_seconds: 240 },
+          },
+        });
+      },
+    });
+
+    expect(ok).toMatchObject({ session: 42, weekly: 73 });
+    expect(headersSeen).toBeDefined();
+    expect(headersSeen["Authorization"]).toBe("Bearer token");
+    expect(headersSeen["ChatGPT-Account-Id"]).toBe("account-123");
   });
 
   it("fetches claude usage with extra spend", async () => {
@@ -743,5 +767,162 @@ describe("usage-bars-core network fetchers", () => {
     expect(all.zai).toEqual({ session: 55, weekly: 66 });
     expect(all.gemini).toEqual({ session: 80, weekly: 80 });
     expect(all.antigravity).toEqual({ session: 60, weekly: 60 });
+  });
+
+  it("fetches opencode-go and reports missing config error if not configured but in auth", async () => {
+    const auth: AuthData = {
+      "opencode-go": { key: "some-key" },
+    };
+    const endpoints: UsageEndpoints = {
+      zai: "",
+      gemini: "",
+      antigravity: "",
+      googleLoadCodeAssistEndpoints: [],
+    };
+    const all = await fetchAllUsages({
+      auth,
+      endpoints,
+      env: {} as any,
+      persist: false,
+    });
+    expect(all["opencode-go"]).toEqual({
+      session: 0,
+      weekly: 0,
+      error: "missing workspaceId or authCookie (set OPENCODE_GO_WORKSPACE_ID/AUTH_COOKIE or config file)",
+    });
+  });
+
+  it("detects opencode-go provider", () => {
+    expect(detectProvider({ provider: "opencode-go" })).toBe("opencode-go");
+  });
+
+  describe("opencode-go config resolver", () => {
+    it("resolves config from environment variables", () => {
+      const config = resolveOpencodeGoConfig({
+        OPENCODE_GO_WORKSPACE_ID: "env-workspace",
+        OPENCODE_GO_AUTH_COOKIE: "env-cookie",
+      } as any);
+      expect(config).toEqual({
+        workspaceId: "env-workspace",
+        authCookie: "env-cookie",
+      });
+    });
+
+    it("returns null when workspaceId or authCookie is missing from env", () => {
+      const config = resolveOpencodeGoConfig({
+        OPENCODE_GO_WORKSPACE_ID: "env-workspace",
+      } as any);
+      expect(config).toBeNull();
+    });
+  });
+
+  describe("opencode-go usage fetcher", () => {
+    it("parses opencode-go quota successfully from HTML", async () => {
+      const mockHtml = `
+        some prefix data
+        rollingUsage:$R[1]={usagePercent:45.5,resetInSec:18000}
+        weeklyUsage:$R[2]={usagePercent:20,resetInSec:360000}
+        monthlyUsage:$R[3]={usagePercent:10,resetInSec:720000}
+        some suffix data
+      `;
+
+      const fetchFn: FetchLike = async () => {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({}),
+          text: async () => mockHtml,
+        };
+      };
+
+      const usage = await fetchOpencodeGoUsage({
+        fetchFn,
+        env: {
+          OPENCODE_GO_WORKSPACE_ID: "test-workspace",
+          OPENCODE_GO_AUTH_COOKIE: "test-cookie",
+        } as any,
+      });
+
+      expect(usage.session).toBe(45.5);
+      expect(usage.weekly).toBe(20);
+      expect(usage.sessionResetsIn).toBe("5h");
+      expect(usage.weeklyResetsIn).toBe("4d 4h");
+      expect(usage.extraSpend).toBe(6); // 10% of 60
+      expect(usage.extraLimit).toBe(60);
+      expect(usage.error).toBeUndefined();
+    });
+
+    it("handles alternative ordering in SolidJS hydration output", async () => {
+      const mockHtml = `
+        rollingUsage:$R[1]={resetInSec:7200,usagePercent:15}
+        weeklyUsage:$R[2]={resetInSec:14400,usagePercent:30}
+        monthlyUsage:$R[3]={resetInSec:28800,usagePercent:45}
+      `;
+
+      const fetchFn: FetchLike = async () => {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({}),
+          text: async () => mockHtml,
+        };
+      };
+
+      const usage = await fetchOpencodeGoUsage({
+        fetchFn,
+        env: {
+          OPENCODE_GO_WORKSPACE_ID: "test-workspace",
+          OPENCODE_GO_AUTH_COOKIE: "test-cookie",
+        } as any,
+      });
+
+      expect(usage.session).toBe(15);
+      expect(usage.weekly).toBe(30);
+      expect(usage.sessionResetsIn).toBe("2h");
+      expect(usage.weeklyResetsIn).toBe("4h");
+      expect(usage.extraSpend).toBe(27); // 45% of 60
+    });
+
+    it("returns error when unable to parse usage", async () => {
+      const fetchFn: FetchLike = async () => {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({}),
+          text: async () => "no data here",
+        };
+      };
+
+      const usage = await fetchOpencodeGoUsage({
+        fetchFn,
+        env: {
+          OPENCODE_GO_WORKSPACE_ID: "test-workspace",
+          OPENCODE_GO_AUTH_COOKIE: "test-cookie",
+        } as any,
+      });
+
+      expect(usage.error).toBe("Could not parse any known OpenCode Go dashboard usage windows");
+    });
+
+    it("returns error on HTTP failure", async () => {
+      const fetchFn: FetchLike = async () => {
+        return {
+          ok: false,
+          status: 500,
+          json: async () => ({}),
+          text: async () => "Internal Server Error",
+        };
+      };
+
+      const usage = await fetchOpencodeGoUsage({
+        fetchFn,
+        env: {
+          OPENCODE_GO_WORKSPACE_ID: "test-workspace",
+          OPENCODE_GO_AUTH_COOKIE: "test-cookie",
+        } as any,
+      });
+
+      expect(usage.error).toBe("HTTP 500");
+    });
   });
 });

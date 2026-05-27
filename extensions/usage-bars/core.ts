@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 
-export type ProviderKey = "codex" | "claude" | "zai" | "gemini" | "antigravity";
+export type ProviderKey = "codex" | "claude" | "zai" | "gemini" | "antigravity" | "opencode-go";
 export type OAuthProviderId = "openai-codex" | "anthropic" | "google-gemini-cli" | "google-antigravity";
 
 export interface AuthData {
@@ -11,6 +11,7 @@ export interface AuthData {
   zai?: { key?: string; access?: string; refresh?: string; expires?: number };
   "google-gemini-cli"?: { access?: string; refresh?: string; projectId?: string; expires?: number };
   "google-antigravity"?: { access?: string; refresh?: string; projectId?: string; expires?: number };
+  "opencode-go"?: { key?: string; access?: string; refresh?: string; expires?: number };
 }
 
 export interface UsageData {
@@ -46,6 +47,7 @@ export interface FetchResponseLike {
   status: number;
   headers?: HeadersLike;
   json(): Promise<any>;
+  text(): Promise<string>;
 }
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<FetchResponseLike>;
@@ -699,11 +701,192 @@ function readClaudeCacheOutcome(cacheFile = DEFAULT_USAGE_CACHE_FILE, nowMs = Da
   return null;
 }
 
-export async function fetchCodexUsage(token: string, config: RequestConfig = {}): Promise<UsageData> {
+interface WindowUsage {
+  usagePercent: number;
+  resetInSec: number;
+}
+
+const SCRAPED_NUMBER_PATTERN = "(-?\\d+(?:\\.\\d+)?)";
+const RE_ROLLING_PCT_FIRST = new RegExp(`rollingUsage:\\$R\\[\\d+\\]=\\{[^}]*usagePercent:${SCRAPED_NUMBER_PATTERN}[^}]*resetInSec:${SCRAPED_NUMBER_PATTERN}[^}]*\\}`);
+const RE_ROLLING_RESET_FIRST = new RegExp(`rollingUsage:\\$R\\[\\d+\\]=\\{[^}]*resetInSec:${SCRAPED_NUMBER_PATTERN}[^}]*usagePercent:${SCRAPED_NUMBER_PATTERN}[^}]*\\}`);
+const RE_WEEKLY_PCT_FIRST = new RegExp(`weeklyUsage:\\$R\\[\\d+\\]=\\{[^}]*usagePercent:${SCRAPED_NUMBER_PATTERN}[^}]*resetInSec:${SCRAPED_NUMBER_PATTERN}[^}]*\\}`);
+const RE_WEEKLY_RESET_FIRST = new RegExp(`weeklyUsage:\\$R\\[\\d+\\]=\\{[^}]*resetInSec:${SCRAPED_NUMBER_PATTERN}[^}]*usagePercent:${SCRAPED_NUMBER_PATTERN}[^}]*\\}`);
+const RE_MONTHLY_PCT_FIRST = new RegExp(`monthlyUsage:\\$R\\[\\d+\\]=\\{[^}]*usagePercent:${SCRAPED_NUMBER_PATTERN}[^}]*resetInSec:${SCRAPED_NUMBER_PATTERN}[^}]*\\}`);
+const RE_MONTHLY_RESET_FIRST = new RegExp(`monthlyUsage:\\$R\\[\\d+\\]=\\{[^}]*resetInSec:${SCRAPED_NUMBER_PATTERN}[^}]*usagePercent:${SCRAPED_NUMBER_PATTERN}[^}]*\\}`);
+
+function parseWindowUsage(
+  html: string,
+  rePctFirst: RegExp,
+  reResetFirst: RegExp
+): WindowUsage | null {
+  const pctFirstMatch = rePctFirst.exec(html);
+  if (pctFirstMatch) {
+    const usagePercent = Number(pctFirstMatch[1]);
+    const resetInSec = Number(pctFirstMatch[2]);
+    if (Number.isFinite(usagePercent) && Number.isFinite(resetInSec)) {
+      return { usagePercent, resetInSec };
+    }
+  }
+  const resetFirstMatch = reResetFirst.exec(html);
+  if (resetFirstMatch) {
+    const resetInSec = Number(resetFirstMatch[1]);
+    const usagePercent = Number(resetFirstMatch[2]);
+    if (Number.isFinite(usagePercent) && Number.isFinite(resetInSec)) {
+      return { usagePercent, resetInSec };
+    }
+  }
+  return null;
+}
+
+export function resolveOpencodeGoConfig(env: NodeJS.ProcessEnv = process.env): { workspaceId: string; authCookie: string } | null {
+  const envWorkspaceId = env.OPENCODE_GO_WORKSPACE_ID?.trim();
+  const envAuthCookie = env.OPENCODE_GO_AUTH_COOKIE?.trim();
+  if (envWorkspaceId && envAuthCookie) {
+    return { workspaceId: envWorkspaceId, authCookie: envAuthCookie };
+  }
+
+  const home = os.homedir();
+  const candidates: string[] = [];
+
+  if (process.platform === "win32") {
+    const appData = env.APPDATA || path.join(home, "AppData", "Roaming");
+    const localAppData = env.LOCALAPPDATA || path.join(home, "AppData", "Local");
+    candidates.push(
+      path.join(appData, "opencode", "opencode-quota", "opencode-go.json"),
+      path.join(localAppData, "opencode", "opencode-quota", "opencode-go.json")
+    );
+  } else if (process.platform === "darwin") {
+    candidates.push(
+      path.join(home, ".config", "opencode", "opencode-quota", "opencode-go.json"),
+      path.join(home, "Library", "Application Support", "opencode", "opencode-quota", "opencode-go.json")
+    );
+  } else {
+    const configHome = env.XDG_CONFIG_HOME || path.join(home, ".config");
+    candidates.push(
+      path.join(configHome, "opencode", "opencode-quota", "opencode-go.json")
+    );
+  }
+
+  for (const file of candidates) {
+    try {
+      if (fs.existsSync(file)) {
+        const content = JSON.parse(fs.readFileSync(file, "utf-8"));
+        const workspaceId = typeof content.workspaceId === "string" ? content.workspaceId.trim() : "";
+        const authCookie = typeof content.authCookie === "string" ? content.authCookie.trim() : "";
+        if (workspaceId && authCookie) {
+          return { workspaceId, authCookie };
+        }
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  return null;
+}
+
+export async function fetchOpencodeGoUsage(config: FetchConfig = {}): Promise<UsageData> {
+  const env = config.env ?? process.env;
+  const credentials = resolveOpencodeGoConfig(env);
+
+  if (!credentials) {
+    return {
+      session: 0,
+      weekly: 0,
+      error: "missing workspaceId or authCookie (set OPENCODE_GO_WORKSPACE_ID/AUTH_COOKIE or config file)",
+    };
+  }
+
+  const url = `https://opencode.ai/workspace/${encodeURIComponent(credentials.workspaceId)}/go`;
+  const fetchFn = config.fetchFn ?? ((fetch as unknown) as FetchLike);
+  const timeoutMs = config.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timeout = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+  try {
+    const response = await fetchFn(url, {
+      method: "GET",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Gecko/20100101 Firefox/148.0",
+        Accept: "text/html",
+        Cookie: `auth=${credentials.authCookie}`,
+      },
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      return {
+        session: 0,
+        weekly: 0,
+        error: `HTTP ${response.status}`,
+      };
+    }
+
+    const html = await response.text();
+    const rolling = parseWindowUsage(html, RE_ROLLING_PCT_FIRST, RE_ROLLING_RESET_FIRST);
+    const weekly = parseWindowUsage(html, RE_WEEKLY_PCT_FIRST, RE_WEEKLY_RESET_FIRST);
+    const monthly = parseWindowUsage(html, RE_MONTHLY_PCT_FIRST, RE_MONTHLY_RESET_FIRST);
+
+    if (!rolling && !weekly && !monthly) {
+      return {
+        session: 0,
+        weekly: 0,
+        error: "Could not parse any known OpenCode Go dashboard usage windows",
+      };
+    }
+
+    const result: UsageData = {
+      session: rolling ? rolling.usagePercent : 0,
+      weekly: weekly ? weekly.usagePercent : 0,
+    };
+
+    if (rolling) {
+      result.sessionResetsIn = formatDuration(rolling.resetInSec);
+    }
+    if (weekly) {
+      result.weeklyResetsIn = formatDuration(weekly.resetInSec);
+    }
+    if (monthly) {
+      result.extraSpend = Number(((monthly.usagePercent / 100) * 60).toFixed(2));
+      result.extraLimit = 60;
+    }
+
+    return result;
+  } catch (error) {
+    return {
+      session: 0,
+      weekly: 0,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+export async function fetchCodexUsage(
+  token: string,
+  accountId?: string | null | RequestConfig,
+  config: RequestConfig = {},
+): Promise<UsageData> {
+  let actualAccountId: string | undefined = undefined;
+  let actualConfig = config;
+  if (accountId && typeof accountId === "object") {
+    actualConfig = accountId as RequestConfig;
+  } else if (typeof accountId === "string") {
+    actualAccountId = accountId;
+  }
+
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+  };
+  if (actualAccountId) {
+    headers["ChatGPT-Account-Id"] = actualAccountId;
+  }
+
   const result = await requestJson(
     "https://chatgpt.com/backend-api/wham/usage",
-    { headers: { Authorization: `Bearer ${token}` } },
-    config,
+    { headers },
+    actualConfig,
   );
 
   if (!result.ok) return { session: 0, weekly: 0, error: result.error };
@@ -1007,26 +1190,35 @@ export function detectProvider(
 
   const provider = (model.provider || "").toLowerCase();
 
-  if (provider === "openai-codex") return "codex";
+  if (provider === "openai-codex" || provider.startsWith("openai-codex-")) return "codex";
   if (provider === "anthropic") return "claude";
   if (provider === "zai") return "zai";
   if (provider === "google-gemini-cli") return "gemini";
   if (provider === "google-antigravity") return "antigravity";
+  if (provider === "opencode-go") return "opencode-go";
 
   return null;
 }
 
-export function providerToOAuthProviderId(active: ProviderKey | null): OAuthProviderId | null {
-  if (active === "codex") return "openai-codex";
+export function providerToOAuthProviderId(active: ProviderKey | null, activeProviderName?: string | null): string | null {
+  if (active === "codex") return activeProviderName ?? "openai-codex";
   if (active === "claude") return "anthropic";
   if (active === "gemini") return "google-gemini-cli";
   if (active === "antigravity") return "google-antigravity";
   return null;
 }
 
-export function canShowForProvider(active: ProviderKey | null, auth: AuthData | null, endpoints: UsageEndpoints): boolean {
+export function canShowForProvider(
+  active: ProviderKey | null,
+  auth: AuthData | null,
+  endpoints: UsageEndpoints,
+  activeProviderName?: string | null,
+): boolean {
   if (!active || !auth) return false;
-  if (active === "codex") return !!(auth["openai-codex"]?.access || auth["openai-codex"]?.refresh);
+  if (active === "codex") {
+    const key = activeProviderName ?? "openai-codex";
+    return !!((auth as any)[key]?.access || (auth as any)[key]?.refresh);
+  }
   if (active === "claude") return !!(auth.anthropic?.access || auth.anthropic?.refresh);
   if (active === "zai") return !!(auth.zai?.access || auth.zai?.key) && !!endpoints.zai;
   if (active === "gemini") {
@@ -1034,6 +1226,9 @@ export function canShowForProvider(active: ProviderKey | null, auth: AuthData | 
   }
   if (active === "antigravity") {
     return !!(auth["google-antigravity"]?.access || auth["google-antigravity"]?.refresh) && !!endpoints.antigravity;
+  }
+  if (active === "opencode-go") {
+    return !!(auth["opencode-go"] || resolveOpencodeGoConfig());
   }
   return false;
 }
@@ -1060,18 +1255,25 @@ export async function fetchAllUsages(config: FetchAllUsagesConfig = {}): Promise
     zai: null,
     gemini: null,
     antigravity: null,
+    "opencode-go": null,
   };
 
   if (!auth) return results;
 
-  const oauthProviders: OAuthProviderId[] = [
-    "openai-codex",
+  const oauthProviders: string[] = [];
+  const codexKeys = Object.keys(auth).filter(k => k === "openai-codex" || k.startsWith("openai-codex-"));
+  if (codexKeys.length > 0) {
+    oauthProviders.push(...codexKeys);
+  } else {
+    oauthProviders.push("openai-codex");
+  }
+  oauthProviders.push(
     "anthropic",
     "google-gemini-cli",
     "google-antigravity",
-  ];
+  );
 
-  const refreshed = await ensureFreshAuthForProviders(oauthProviders, {
+  const refreshed = await ensureFreshAuthForProviders(oauthProviders as any, {
     ...config,
     auth,
     authFile,
@@ -1079,8 +1281,8 @@ export async function fetchAllUsages(config: FetchAllUsagesConfig = {}): Promise
 
   const authData = refreshed.auth ?? auth;
 
-  const refreshError = (providerId: OAuthProviderId): string | null => {
-    const error = refreshed.refreshErrors[providerId];
+  const refreshError = (providerId: string): string | null => {
+    const error = refreshed.refreshErrors[providerId as any];
     return error ? `auth refresh failed (${error})` : null;
   };
 
@@ -1097,10 +1299,14 @@ export async function fetchAllUsages(config: FetchAllUsagesConfig = {}): Promise
     );
   };
 
-  if (authData["openai-codex"]?.access) {
-    const err = refreshError("openai-codex");
+  const activeCodexKey = codexKeys.find(k => (authData as any)[k]?.access) ?? "openai-codex";
+  if ((authData as any)[activeCodexKey]?.access) {
+    const err = refreshError(activeCodexKey);
     if (err) results.codex = { session: 0, weekly: 0, error: err };
-    else assign("codex", fetchCodexUsage(authData["openai-codex"].access, config));
+    else {
+      const accountId = (authData as any)[activeCodexKey].accountId;
+      assign("codex", fetchCodexUsage((authData as any)[activeCodexKey].access, accountId, config));
+    }
   }
 
   if (authData.anthropic?.access || authData.anthropic?.refresh) {
@@ -1147,6 +1353,10 @@ export async function fetchAllUsages(config: FetchAllUsagesConfig = {}): Promise
         fetchGoogleUsage(creds.access!, endpoints.antigravity, creds.projectId, "antigravity", { ...config, endpoints }),
       );
     }
+  }
+
+  if (authData["opencode-go"] || resolveOpencodeGoConfig(config.env)) {
+    assign("opencode-go", fetchOpencodeGoUsage(config));
   }
 
   await Promise.all(tasks);
