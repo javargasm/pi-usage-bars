@@ -25,6 +25,8 @@ import {
   fetchCodexUsage,
   fetchGoogleUsage,
   fetchZaiUsage,
+  fetchOpencodeGoUsage,
+  resolveOpencodeGoConfig,
   ensureFreshAuthForProviders,
   providerToOAuthProviderId,
   readAuth,
@@ -43,6 +45,7 @@ const PROVIDER_LABELS: Record<ProviderKey, string> = {
   zai: "Z.AI",
   gemini: "Gemini",
   antigravity: "Antigravity",
+  "opencode-go": "OpenCode Go",
 };
 
 interface SubscriptionItem {
@@ -134,6 +137,7 @@ class UsageSelectorComponent extends Container implements Focusable {
       { key: "zai", name: "Z.AI" },
       { key: "gemini", name: "Gemini" },
       { key: "antigravity", name: "Antigravity" },
+      { key: "opencode-go", name: "OpenCode Go" },
     ];
 
     this.allItems = [];
@@ -224,6 +228,25 @@ class UsageSelectorComponent extends Container implements Focusable {
         ),
       );
 
+      if (typeof item.data.monthly === "number") {
+        const monthly = clampPercent(item.data.monthly);
+        const monthlyReset = item.data.monthlyResetsIn
+          ? t.fg("dim", `  resets in ${item.data.monthlyResetsIn}`)
+          : "";
+        this.listContainer.addChild(
+          new Text(
+            indent +
+              t.fg("muted", "Monthly  ") +
+              this.renderBar(monthly) +
+              " " +
+              t.fg(colorForPercent(monthly), `${monthly}%`.padStart(4)) +
+              monthlyReset,
+            0,
+            0,
+          ),
+        );
+      }
+
       if (typeof item.data.extraSpend === "number" && typeof item.data.extraLimit === "number") {
         this.listContainer.addChild(
           new Text(
@@ -295,6 +318,7 @@ class UsageSelectorComponent extends Container implements Focusable {
 interface UsageState extends UsageByProvider {
   lastPoll: number;
   activeProvider: ProviderKey | null;
+  activeProviderName: string | null;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -305,8 +329,10 @@ export default function (pi: ExtensionAPI) {
     zai: null,
     gemini: null,
     antigravity: null,
+    "opencode-go": null,
     lastPoll: 0,
     activeProvider: null,
+    activeProviderName: null,
   };
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -354,7 +380,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     const auth = readAuth();
-    if (!canShowForProvider(active, auth, endpoints)) {
+    if (!canShowForProvider(active, auth, endpoints, state.activeProviderName)) {
       ctx.ui.setStatus(STATUS_KEY, undefined);
       return;
     }
@@ -380,7 +406,9 @@ export default function (pi: ExtensionAPI) {
     const staleSuffix = data.stale ? theme.fg("warning", " stale") : "";
     const warningSuffix = data.warning && !data.stale ? theme.fg("warning", " ⚠") : "";
 
-    const status =
+    const monthlyReset = data.monthlyResetsIn ? theme.fg("dim", ` ⟳ ${data.monthlyResetsIn}`) : "";
+
+    let status =
       theme.fg("dim", `${label} `) +
       theme.fg("muted", "S ") +
       renderBar(theme, session) +
@@ -391,18 +419,30 @@ export default function (pi: ExtensionAPI) {
       renderBar(theme, weekly) +
       " " +
       renderPercent(theme, weekly) +
-      weeklyReset +
-      staleSuffix +
-      warningSuffix;
+      weeklyReset;
+
+    if (typeof data.monthly === "number") {
+      const monthly = clampPercent(data.monthly);
+      status +=
+        theme.fg("muted", " M ") +
+        renderBar(theme, monthly) +
+        " " +
+        renderPercent(theme, monthly) +
+        monthlyReset;
+    }
+
+    status += staleSuffix + warningSuffix;
 
     ctx.ui.setStatus(STATUS_KEY, status);
   }
 
   function updateProviderFrom(modelLike: any): boolean {
     const previous = state.activeProvider;
+    const previousName = state.activeProviderName;
     state.activeProvider = detectProvider(modelLike);
+    state.activeProviderName = modelLike && typeof modelLike === "object" ? modelLike.provider ?? null : null;
 
-    if (previous !== state.activeProvider) {
+    if (previous !== state.activeProvider || previousName !== state.activeProviderName) {
       updateStatus();
       return true;
     }
@@ -413,19 +453,20 @@ export default function (pi: ExtensionAPI) {
   async function runPoll() {
     let auth = readAuth();
     const active = state.activeProvider;
+    const activeName = state.activeProviderName;
 
     const setActiveError = (message: string) => {
       if (!active) return;
       state[active] = { session: 0, weekly: 0, error: message };
     };
 
-    if (!canShowForProvider(active, auth, endpoints)) {
+    if (!canShowForProvider(active, auth, endpoints, activeName)) {
       state.lastPoll = Date.now();
       updateStatus();
       return;
     }
 
-    const oauthProviderId = providerToOAuthProviderId(active);
+    const oauthProviderId = providerToOAuthProviderId(active, activeName);
     if (oauthProviderId && auth) {
       const refreshed = await ensureFreshAuthForProviders([oauthProviderId], { auth });
       auth = refreshed.auth;
@@ -439,36 +480,40 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    if (!auth) {
+    if (!auth && active !== "opencode-go") {
       state.lastPoll = Date.now();
       updateStatus();
       return;
     }
 
     if (active === "codex") {
-      const access = auth["openai-codex"]?.access;
+      const key = activeName ?? "openai-codex";
+      const access = (auth as any)[key]?.access;
+      const accountId = (auth as any)[key]?.accountId;
       state.codex = access
-        ? await fetchCodexUsage(access)
+        ? await fetchCodexUsage(access, accountId)
         : { session: 0, weekly: 0, error: "missing access token (try /login again)" };
     } else if (active === "claude") {
-      state.claude = auth.anthropic?.access || auth.anthropic?.refresh
+      state.claude = auth?.anthropic?.access || auth?.anthropic?.refresh
         ? (await fetchClaudeUsageWithFallback({ auth })).usage
         : { session: 0, weekly: 0, error: "missing access token (try /login again)" };
     } else if (active === "zai") {
-      const token = auth.zai?.access || auth.zai?.key;
+      const token = auth?.zai?.access || auth?.zai?.key;
       state.zai = token
         ? await fetchZaiUsage(token, { endpoints })
         : { session: 0, weekly: 0, error: "missing token (try /login again)" };
     } else if (active === "gemini") {
-      const creds = auth["google-gemini-cli"];
+      const creds = auth?.["google-gemini-cli"];
       state.gemini = creds?.access
         ? await fetchGoogleUsage(creds.access, endpoints.gemini, creds.projectId, "gemini", { endpoints })
         : { session: 0, weekly: 0, error: "missing access token (try /login again)" };
     } else if (active === "antigravity") {
-      const creds = auth["google-antigravity"];
+      const creds = auth?.["google-antigravity"];
       state.antigravity = creds?.access
         ? await fetchGoogleUsage(creds.access, endpoints.antigravity, creds.projectId, "antigravity", { endpoints })
         : { session: 0, weekly: 0, error: "missing access token (try /login again)" };
+    } else if (active === "opencode-go") {
+      state["opencode-go"] = await fetchOpencodeGoUsage({ endpoints });
     }
 
     state.lastPoll = Date.now();
@@ -521,7 +566,14 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("turn_start", async (_event, _ctx) => {
     ctx = _ctx;
+    const changed = updateProviderFrom(_ctx.model);
+    if (changed) await poll();
+  });
+
+  pi.on("turn_end", async (_event, _ctx) => {
+    ctx = _ctx;
     updateProviderFrom(_ctx.model);
+    await poll();
   });
 
   pi.on("model_select", async (event, _ctx) => {

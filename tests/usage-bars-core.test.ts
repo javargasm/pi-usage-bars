@@ -1,7 +1,16 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn, beforeAll, afterAll } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+
+let homedirSpy: any;
+beforeAll(() => {
+  homedirSpy = spyOn(os, "homedir").mockReturnValue("/nonexistent-home-for-tests");
+});
+
+afterAll(() => {
+  homedirSpy?.mockRestore();
+});
 import {
   canShowForProvider,
   detectProvider,
@@ -845,8 +854,10 @@ describe("usage-bars-core network fetchers", () => {
 
       expect(usage.session).toBe(45.5);
       expect(usage.weekly).toBe(20);
+      expect(usage.monthly).toBe(10);
       expect(usage.sessionResetsIn).toBe("5h");
       expect(usage.weeklyResetsIn).toBe("4d 4h");
+      expect(usage.monthlyResetsIn).toBe("8d 8h");
       expect(usage.extraSpend).toBe(6); // 10% of 60
       expect(usage.extraLimit).toBe(60);
       expect(usage.error).toBeUndefined();
@@ -878,8 +889,10 @@ describe("usage-bars-core network fetchers", () => {
 
       expect(usage.session).toBe(15);
       expect(usage.weekly).toBe(30);
+      expect(usage.monthly).toBe(45);
       expect(usage.sessionResetsIn).toBe("2h");
       expect(usage.weeklyResetsIn).toBe("4h");
+      expect(usage.monthlyResetsIn).toBe("8h");
       expect(usage.extraSpend).toBe(27); // 45% of 60
     });
 

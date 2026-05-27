@@ -17,10 +17,13 @@ export interface AuthData {
 export interface UsageData {
   session: number;
   weekly: number;
+  monthly?: number;
   sessionResetsIn?: string;
   weeklyResetsIn?: string;
+  monthlyResetsIn?: string;
   sessionResetsAt?: string;
   weeklyResetsAt?: string;
+  monthlyResetsAt?: string;
   extraSpend?: number;
   extraLimit?: number;
   warning?: string;
@@ -847,6 +850,8 @@ export async function fetchOpencodeGoUsage(config: FetchConfig = {}): Promise<Us
       result.weeklyResetsIn = formatDuration(weekly.resetInSec);
     }
     if (monthly) {
+      result.monthly = monthly.usagePercent;
+      result.monthlyResetsIn = formatDuration(monthly.resetInSec);
       result.extraSpend = Number(((monthly.usagePercent / 100) * 60).toFixed(2));
       result.extraLimit = 60;
     }
