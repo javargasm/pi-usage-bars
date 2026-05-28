@@ -13,6 +13,7 @@ afterAll(() => {
 });
 import {
   canShowForProvider,
+  codexLabelFromKey,
   detectProvider,
   discoverGoogleProjectId,
   ensureFreshAuthForProviders,
@@ -776,6 +777,12 @@ describe("usage-bars-core network fetchers", () => {
     expect(all.zai).toEqual({ session: 55, weekly: 66 });
     expect(all.gemini).toEqual({ session: 80, weekly: 80 });
     expect(all.antigravity).toEqual({ session: 60, weekly: 60 });
+
+    // Single codex key should produce one subscription
+    expect(all.codexSubscriptions).toHaveLength(1);
+    expect(all.codexSubscriptions[0]!.authKey).toBe("openai-codex");
+    expect(all.codexSubscriptions[0]!.label).toBe("Codex");
+    expect(all.codexSubscriptions[0]!.usage).toEqual({ session: 11, weekly: 22, sessionResetsIn: undefined, weeklyResetsIn: undefined });
   });
 
   it("fetches opencode-go and reports missing config error if not configured but in auth", async () => {
@@ -803,6 +810,67 @@ describe("usage-bars-core network fetchers", () => {
 
   it("detects opencode-go provider", () => {
     expect(detectProvider({ provider: "opencode-go" })).toBe("opencode-go");
+  });
+
+  it("codexLabelFromKey returns correct labels", () => {
+    expect(codexLabelFromKey("openai-codex")).toBe("Codex");
+    expect(codexLabelFromKey("openai-codex-2")).toBe("Codex 2");
+    expect(codexLabelFromKey("openai-codex-n")).toBe("Codex N");
+    expect(codexLabelFromKey("openai-codex-pro")).toBe("Codex Pro");
+  });
+
+  it("fetchAllUsages returns all codex subscriptions individually", async () => {
+    const auth: AuthData = {
+      "openai-codex": { access: "token-1" },
+      "openai-codex-2": { access: "token-2" },
+      "openai-codex-n": { access: "token-n" },
+    };
+
+    const endpoints: UsageEndpoints = {
+      zai: "",
+      gemini: "",
+      antigravity: "",
+      googleLoadCodeAssistEndpoints: [],
+    };
+
+    const tokenToUsage: Record<string, { primary: number; secondary: number }> = {
+      "token-1": { primary: 10, secondary: 20 },
+      "token-2": { primary: 30, secondary: 40 },
+      "token-n": { primary: 50, secondary: 60 },
+    };
+
+    const fetchFn: FetchLike = async (_url, init) => {
+      const authHeader = String((init?.headers as any)?.Authorization || "");
+      const token = authHeader.replace("Bearer ", "");
+      const data = tokenToUsage[token];
+      if (!data) return jsonResponse(401, {});
+      return jsonResponse(200, {
+        rate_limit: {
+          primary_window: { used_percent: data.primary },
+          secondary_window: { used_percent: data.secondary },
+        },
+      });
+    };
+
+    const all = await fetchAllUsages({ auth, endpoints, fetchFn, env: {} as any, persist: false });
+
+    // Should have 3 subscriptions
+    expect(all.codexSubscriptions).toHaveLength(3);
+
+    const sub1 = all.codexSubscriptions.find(s => s.authKey === "openai-codex")!;
+    expect(sub1.label).toBe("Codex");
+    expect(sub1.usage).toMatchObject({ session: 10, weekly: 20 });
+
+    const sub2 = all.codexSubscriptions.find(s => s.authKey === "openai-codex-2")!;
+    expect(sub2.label).toBe("Codex 2");
+    expect(sub2.usage).toMatchObject({ session: 30, weekly: 40 });
+
+    const subN = all.codexSubscriptions.find(s => s.authKey === "openai-codex-n")!;
+    expect(subN.label).toBe("Codex N");
+    expect(subN.usage).toMatchObject({ session: 50, weekly: 60 });
+
+    // Backward compat: codex slot has first subscription
+    expect(all.codex).toMatchObject({ session: 10, weekly: 20 });
   });
 
   describe("opencode-go config resolver", () => {

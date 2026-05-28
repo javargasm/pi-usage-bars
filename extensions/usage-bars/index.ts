@@ -32,7 +32,7 @@ import {
   readAuth,
   resolveUsageEndpoints,
   type ProviderKey,
-  type UsageByProvider,
+  type UsageByProviderMulti,
   type UsageData,
 } from "./core";
 
@@ -51,6 +51,7 @@ const PROVIDER_LABELS: Record<ProviderKey, string> = {
 interface SubscriptionItem {
   name: string;
   provider: ProviderKey;
+  authKey?: string;
   data: UsageData | null;
   isActive: boolean;
 }
@@ -67,7 +68,8 @@ class UsageSelectorComponent extends Container implements Focusable {
   private selectedIndex = 0;
   private loading = true;
   private activeProvider: ProviderKey | null;
-  private fetchAllFn: () => Promise<UsageByProvider>;
+  private activeProviderName: string | null;
+  private fetchAllFn: () => Promise<UsageByProviderMulti>;
   private _focused = false;
 
   get focused(): boolean {
@@ -83,13 +85,15 @@ class UsageSelectorComponent extends Container implements Focusable {
     tui: any,
     theme: any,
     activeProvider: ProviderKey | null,
-    fetchAll: () => Promise<UsageByProvider>,
+    activeProviderName: string | null,
+    fetchAll: () => Promise<UsageByProviderMulti>,
     onCancel: () => void,
   ) {
     super();
     this.tui = tui;
     this.theme = theme;
     this.activeProvider = activeProvider;
+    this.activeProviderName = activeProviderName;
     this.fetchAllFn = fetchAll;
     this.onCancelCallback = onCancel;
 
@@ -130,9 +134,22 @@ class UsageSelectorComponent extends Container implements Focusable {
     this.updateList();
   }
 
-  private buildItems(results: UsageByProvider) {
-    const providers: Array<{ key: ProviderKey; name: string }> = [
-      { key: "codex", name: "Codex" },
+  private buildItems(results: UsageByProviderMulti) {
+    this.allItems = [];
+
+    // Expand codex subscriptions into individual items
+    for (const sub of results.codexSubscriptions) {
+      this.allItems.push({
+        name: sub.label,
+        provider: "codex",
+        authKey: sub.authKey,
+        data: sub.usage,
+        isActive: this.activeProvider === "codex" && this.activeProviderName === sub.authKey,
+      });
+    }
+
+    // Non-codex providers
+    const otherProviders: Array<{ key: ProviderKey; name: string }> = [
       { key: "claude", name: "Claude" },
       { key: "zai", name: "Z.AI" },
       { key: "gemini", name: "Gemini" },
@@ -140,8 +157,7 @@ class UsageSelectorComponent extends Container implements Focusable {
       { key: "opencode-go", name: "OpenCode Go" },
     ];
 
-    this.allItems = [];
-    for (const p of providers) {
+    for (const p of otherProviders) {
       if (results[p.key] !== null) {
         this.allItems.push({
           name: p.name,
@@ -595,6 +611,7 @@ export default function (pi: ExtensionAPI) {
               tui,
               theme,
               state.activeProvider,
+              state.activeProviderName,
               () => fetchAllUsages({ endpoints }),
               () => done(),
             );

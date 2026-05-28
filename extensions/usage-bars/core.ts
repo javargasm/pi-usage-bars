@@ -34,6 +34,16 @@ export interface UsageData {
 
 export type UsageByProvider = Record<ProviderKey, UsageData | null>;
 
+export interface CodexSubscription {
+  authKey: string;
+  label: string;
+  usage: UsageData | null;
+}
+
+export interface UsageByProviderMulti extends UsageByProvider {
+  codexSubscriptions: CodexSubscription[];
+}
+
 export interface UsageEndpoints {
   zai: string;
   gemini: string;
@@ -1187,6 +1197,12 @@ export async function fetchGoogleUsage(
   return parsed;
 }
 
+export function codexLabelFromKey(key: string): string {
+  if (key === "openai-codex") return "Codex";
+  const suffix = key.replace("openai-codex-", "");
+  return `Codex ${suffix.charAt(0).toUpperCase() + suffix.slice(1)}`;
+}
+
 export function detectProvider(
   model: { provider?: string; id?: string; name?: string; api?: string } | string | undefined | null,
 ): ProviderKey | null {
@@ -1249,18 +1265,19 @@ export function colorForPercent(value: number): "success" | "warning" | "error" 
   return "success";
 }
 
-export async function fetchAllUsages(config: FetchAllUsagesConfig = {}): Promise<UsageByProvider> {
+export async function fetchAllUsages(config: FetchAllUsagesConfig = {}): Promise<UsageByProviderMulti> {
   const authFile = config.authFile ?? DEFAULT_AUTH_FILE;
   const auth = config.auth ?? readAuth(authFile);
   const endpoints = config.endpoints ?? resolveUsageEndpoints(config.env);
 
-  const results: UsageByProvider = {
+  const results: UsageByProviderMulti = {
     codex: null,
     claude: null,
     zai: null,
     gemini: null,
     antigravity: null,
     "opencode-go": null,
+    codexSubscriptions: [],
   };
 
   if (!auth) return results;
@@ -1304,15 +1321,29 @@ export async function fetchAllUsages(config: FetchAllUsagesConfig = {}): Promise
     );
   };
 
-  const activeCodexKey = codexKeys.find(k => (authData as any)[k]?.access) ?? "openai-codex";
-  if ((authData as any)[activeCodexKey]?.access) {
-    const err = refreshError(activeCodexKey);
-    if (err) results.codex = { session: 0, weekly: 0, error: err };
-    else {
-      const accountId = (authData as any)[activeCodexKey].accountId;
-      assign("codex", fetchCodexUsage((authData as any)[activeCodexKey].access, accountId, config));
+  // Fetch ALL codex subscriptions individually
+  const codexSubs: CodexSubscription[] = [];
+  for (const key of codexKeys) {
+    const creds = (authData as any)[key];
+    if (!creds?.access) continue;
+
+    const err = refreshError(key);
+    if (err) {
+      codexSubs.push({ authKey: key, label: codexLabelFromKey(key), usage: { session: 0, weekly: 0, error: err } });
+      continue;
     }
+
+    const sub: CodexSubscription = { authKey: key, label: codexLabelFromKey(key), usage: null };
+    codexSubs.push(sub);
+    tasks.push(
+      fetchCodexUsage(creds.access, creds.accountId, config)
+        .then((usage) => { sub.usage = usage; })
+        .catch((error) => { sub.usage = { session: 0, weekly: 0, error: toErrorMessage(error) }; }),
+    );
   }
+
+  // Backward compat: populate the single codex slot with the first subscription
+  // (assigned after Promise.all so sub.usage is resolved)
 
   if (authData.anthropic?.access || authData.anthropic?.refresh) {
     const err = refreshError("anthropic");
@@ -1365,5 +1396,9 @@ export async function fetchAllUsages(config: FetchAllUsagesConfig = {}): Promise
   }
 
   await Promise.all(tasks);
+  results.codexSubscriptions = codexSubs;
+  if (codexSubs.length > 0) {
+    results.codex = codexSubs[0]!.usage;
+  }
   return results;
 }
