@@ -25,6 +25,7 @@ import {
   fetchCodexUsage,
   fetchGoogleUsage,
   fetchZaiUsage,
+  fetchKiroUsage,
   fetchOpencodeGoUsage,
   resolveOpencodeGoConfig,
   ensureFreshAuthForProviders,
@@ -46,6 +47,7 @@ const PROVIDER_LABELS: Record<ProviderKey, string> = {
   gemini: "Gemini",
   antigravity: "Antigravity",
   "opencode-go": "OpenCode Go",
+  kiro: "Kiro",
 };
 
 interface SubscriptionItem {
@@ -424,20 +426,38 @@ export default function (pi: ExtensionAPI) {
 
     const monthlyReset = data.monthlyResetsIn ? theme.fg("dim", ` ⟳ ${data.monthlyResetsIn}`) : "";
 
-    let status =
-      theme.fg("dim", `${label} `) +
-      theme.fg("muted", "S ") +
-      renderBar(theme, session) +
-      " " +
-      renderPercent(theme, session) +
-      sessionReset +
-      theme.fg("muted", " W ") +
-      renderBar(theme, weekly) +
-      " " +
-      renderPercent(theme, weekly) +
-      weeklyReset;
+    let status: string;
 
-    if (typeof data.monthly === "number") {
+    // Kiro uses a single credits bar instead of session+weekly
+    if (active === "kiro") {
+      const credits = clampPercent(data.session);
+      const creditsReset = data.monthlyResetsIn ? theme.fg("dim", ` ⟳ ${data.monthlyResetsIn}`) : "";
+      const planSuffix = data.planTitle ? `${data.planTitle} ` : "";
+
+      status =
+        theme.fg("dim", `${label} `) +
+        theme.fg("accent", planSuffix) +
+        theme.fg("muted", "C ") +
+        renderBar(theme, credits) +
+        " " +
+        renderPercent(theme, credits) +
+        creditsReset;
+    } else {
+      status =
+        theme.fg("dim", `${label} `) +
+        theme.fg("muted", "S ") +
+        renderBar(theme, session) +
+        " " +
+        renderPercent(theme, session) +
+        sessionReset +
+        theme.fg("muted", " W ") +
+        renderBar(theme, weekly) +
+        " " +
+        renderPercent(theme, weekly) +
+        weeklyReset;
+    }
+
+    if (typeof data.monthly === "number" && active !== "kiro") {
       const monthly = clampPercent(data.monthly);
       status +=
         theme.fg("muted", " M ") +
@@ -530,6 +550,10 @@ export default function (pi: ExtensionAPI) {
         : { session: 0, weekly: 0, error: "missing access token (try /login again)" };
     } else if (active === "opencode-go") {
       state["opencode-go"] = await fetchOpencodeGoUsage({ endpoints });
+    } else if (active === "kiro") {
+      state.kiro = auth?.kiro?.access || auth?.kiro?.refresh
+        ? await fetchKiroUsage({ endpoints })
+        : { session: 0, weekly: 0, error: "missing credentials (try /login)" };
     }
 
     state.lastPoll = Date.now();

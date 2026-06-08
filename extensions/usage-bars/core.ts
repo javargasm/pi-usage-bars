@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 
-export type ProviderKey = "codex" | "claude" | "zai" | "gemini" | "antigravity" | "opencode-go";
+export type ProviderKey = "codex" | "claude" | "zai" | "gemini" | "antigravity" | "opencode-go" | "kiro";
 export type OAuthProviderId = "openai-codex" | "anthropic" | "google-gemini-cli" | "google-antigravity";
 
 export interface AuthData {
@@ -12,6 +12,15 @@ export interface AuthData {
   "google-gemini-cli"?: { access?: string; refresh?: string; projectId?: string; expires?: number };
   "google-antigravity"?: { access?: string; refresh?: string; projectId?: string; expires?: number };
   "opencode-go"?: { key?: string; access?: string; refresh?: string; expires?: number };
+  kiro?: {
+    access?: string;
+    refresh?: string;
+    expires?: number;
+    clientId?: string;
+    clientSecret?: string;
+    region?: string;
+    authMethod?: string;
+  };
 }
 
 export interface UsageData {
@@ -29,6 +38,7 @@ export interface UsageData {
   warning?: string;
   stale?: boolean;
   fetchedAt?: number;
+  planTitle?: string;
   error?: string;
 }
 
@@ -1217,6 +1227,7 @@ export function detectProvider(
   if (provider === "google-gemini-cli") return "gemini";
   if (provider === "google-antigravity") return "antigravity";
   if (provider === "opencode-go") return "opencode-go";
+  if (provider === "kiro") return "kiro";
 
   return null;
 }
@@ -1251,7 +1262,220 @@ export function canShowForProvider(
   if (active === "opencode-go") {
     return !!(auth["opencode-go"] || resolveOpencodeGoConfig());
   }
+  if (active === "kiro") {
+    return !!(auth.kiro?.access || auth.kiro?.refresh);
+  }
   return false;
+}
+
+/** Maps SSO regions to the closest Kiro API region. */
+function resolveKiroApiRegion(ssoRegion: string): string {
+  const map: Record<string, string> = {
+    "eu-west-1": "eu-central-1",
+    "eu-west-2": "eu-central-1",
+    "eu-west-3": "eu-central-1",
+    "eu-north-1": "eu-central-1",
+    "us-west-1": "us-east-1",
+    "us-west-2": "us-east-1",
+    "us-east-2": "us-east-1",
+    "ap-southeast-1": "ap-southeast-1",
+    "ap-northeast-1": "ap-northeast-1",
+  };
+  return map[ssoRegion] ?? ssoRegion;
+}
+
+/**
+ * Refreshes a Kiro token using the AWS SSO-OIDC token endpoint.
+ *
+ * The refresh token in auth.json is packed as:
+ * `refreshToken|clientId|clientSecret|authMethod`
+ */
+async function refreshKiroAuth(
+  creds: NonNullable<AuthData["kiro"]>,
+  config: RequestConfig = {},
+): Promise<NonNullable<AuthData["kiro"]>> {
+  const parts = (creds.refresh ?? "").split("|");
+  const refreshToken = parts[0] ?? "";
+  const clientId = creds.clientId ?? parts[1] ?? "";
+  const clientSecret = creds.clientSecret ?? parts[2] ?? "";
+  const authMethod = creds.authMethod ?? parts[3] ?? "idc";
+  const region = creds.region ?? "us-east-1";
+
+  if (!refreshToken || !clientId || !clientSecret) {
+    throw new Error("Kiro refresh token missing clientId/clientSecret — re-login required");
+  }
+
+  const endpoint = `https://oidc.${region}.amazonaws.com/token`;
+  const fetchFn = config.fetchFn ?? ((fetch as unknown) as FetchLike);
+
+  const response = await fetchFn(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "User-Agent": "pi-usage-bars" },
+    body: JSON.stringify({ clientId, clientSecret, refreshToken, grantType: "refresh_token" }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Kiro token refresh failed: HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+
+  return {
+    access: data.accessToken,
+    refresh: `${data.refreshToken}|${clientId}|${clientSecret}|${authMethod}`,
+    expires: Date.now() + ((data.expiresIn ?? 3600) * 1000) - 5 * 60 * 1000,
+    clientId,
+    clientSecret,
+    region,
+    authMethod,
+  };
+}
+
+/**
+ * Resolves the Kiro profile ARN by calling ListAvailableProfiles.
+ *
+ * The profile ARN is needed for the getUsageLimits endpoint.
+ * If the call fails, returns null to allow a graceful fallback.
+ */
+async function resolveKiroProfileArn(
+  token: string,
+  apiRegion: string,
+  config: RequestConfig = {},
+): Promise<string | null> {
+  const result = await requestJson(
+    `https://q.${apiRegion}.amazonaws.com/`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/x-amz-json-1.0",
+        "X-Amz-Target": "AmazonCodeWhispererService.ListAvailableProfiles",
+      },
+      body: "{}",
+    },
+    config,
+  );
+
+  if (!result.ok) return null;
+
+  const profiles: any[] = result.data?.profiles ?? [];
+  const kiroProfile = profiles.find((p: any) => p.profileType === "KIRO" && p.status === "ACTIVE");
+  return kiroProfile?.arn ?? profiles[0]?.arn ?? null;
+}
+
+/**
+ * Fetches Kiro credit usage from the getUsageLimits REST endpoint.
+ *
+ * Maps the credit-based response into UsageData with:
+ * - session = credit usage percentage (currentUsage / usageLimit * 100)
+ * - weekly = 0 (Kiro uses monthly credit pools, not weekly windows)
+ * - monthly = same as session (credits reset monthly)
+ * - monthlyResetsIn = time until nextDateReset
+ */
+export async function fetchKiroUsage(config: FetchConfig = {}): Promise<UsageData> {
+  const authFile = config.authFile ?? DEFAULT_AUTH_FILE;
+  let auth = readAuth(authFile);
+  let creds = auth?.kiro;
+
+  if (!creds?.access && !creds?.refresh) {
+    return { session: 0, weekly: 0, error: "missing Kiro credentials (try /login)" };
+  }
+
+  // Refresh token if expired
+  if (creds.refresh && isCredentialExpired(creds, Date.now())) {
+    try {
+      creds = await refreshKiroAuth(creds, config);
+      if (auth) {
+        auth.kiro = creds;
+        writeAuth(auth, authFile);
+      }
+    } catch (error) {
+      return { session: 0, weekly: 0, error: `auth refresh failed (${toErrorMessage(error)})` };
+    }
+  }
+
+  if (!creds.access) {
+    return { session: 0, weekly: 0, error: "missing access token after refresh" };
+  }
+
+  const apiRegion = resolveKiroApiRegion(creds.region ?? "us-east-1");
+
+  // Resolve profile ARN
+  const profileArn = await resolveKiroProfileArn(creds.access, apiRegion, config);
+
+  // Call getUsageLimits
+  const url = new URL(`https://q.${apiRegion}.amazonaws.com/getUsageLimits`);
+  url.searchParams.set("isEmailRequired", "true");
+  url.searchParams.set("origin", "AI_EDITOR");
+  if (profileArn) url.searchParams.set("profileArn", profileArn);
+
+  const result = await requestJson(
+    url.toString(),
+    {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${creds.access}`,
+        "Content-Type": "application/json",
+        "x-amzn-kiro-agent-mode": "vibe",
+        "amz-sdk-request": "attempt=1; max=1",
+      },
+    },
+    config,
+  );
+
+  if (!result.ok) {
+    return { session: 0, weekly: 0, error: result.error };
+  }
+
+  const data = result.data;
+  let usedCount = 0;
+  let limitCount = 0;
+  let nextReset: number | null = null;
+
+  if (Array.isArray(data.usageBreakdownList)) {
+    for (const entry of data.usageBreakdownList) {
+      usedCount += entry.currentUsage ?? 0;
+      limitCount += entry.usageLimit ?? 0;
+      if (entry.freeTrialInfo) {
+        usedCount += entry.freeTrialInfo.currentUsage ?? 0;
+        limitCount += entry.freeTrialInfo.usageLimit ?? 0;
+      }
+      if (entry.nextDateReset) {
+        nextReset = entry.nextDateReset;
+      }
+    }
+  }
+
+  const percentage = limitCount > 0 ? Number(((usedCount / limitCount) * 100).toFixed(2)) : 0;
+
+  const result_usage: UsageData = {
+    session: percentage,
+    weekly: 0,
+    monthly: percentage,
+    fetchedAt: Date.now(),
+  };
+
+  // nextDateReset is in epoch SECONDS
+  if (nextReset) {
+    const resetMs = nextReset * 1000;
+    const diffSec = Math.max(0, (resetMs - Date.now()) / 1000);
+    result_usage.monthlyResetsIn = formatDuration(diffSec);
+    result_usage.sessionResetsIn = result_usage.monthlyResetsIn;
+  }
+
+  const subTitle = data.subscriptionInfo?.subscriptionTitle;
+  if (subTitle) {
+    // Strip "KIRO " prefix (the label already shows "Kiro") and title-case.
+    const planName = subTitle.replace(/^KIRO\s+/i, "").replace(/\w\S*/g, (w: string) =>
+      w.charAt(0).toUpperCase() + w.slice(1).toLowerCase(),
+    );
+    result_usage.planTitle = planName;
+  }
+  if (subTitle && percentage >= 90) {
+    result_usage.warning = `${subTitle}: ${usedCount}/${limitCount} credits`;
+  }
+
+  return result_usage;
 }
 
 export function clampPercent(value: number): number {
@@ -1277,6 +1501,7 @@ export async function fetchAllUsages(config: FetchAllUsagesConfig = {}): Promise
     gemini: null,
     antigravity: null,
     "opencode-go": null,
+    kiro: null,
     codexSubscriptions: [],
   };
 
@@ -1393,6 +1618,10 @@ export async function fetchAllUsages(config: FetchAllUsagesConfig = {}): Promise
 
   if (authData["opencode-go"] || resolveOpencodeGoConfig(config.env)) {
     assign("opencode-go", fetchOpencodeGoUsage(config));
+  }
+
+  if (authData.kiro?.access || authData.kiro?.refresh) {
+    assign("kiro", fetchKiroUsage(config));
   }
 
   await Promise.all(tasks);
