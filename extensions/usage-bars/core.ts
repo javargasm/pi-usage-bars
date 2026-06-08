@@ -1336,6 +1336,7 @@ async function refreshKiroAuth(
   const data = await response.json();
 
   return {
+    type: "oauth",
     access: data.accessToken,
     refresh: `${data.refreshToken}|${clientId}|${clientSecret}|${authMethod}`,
     expires: Date.now() + ((data.expiresIn ?? 3600) * 1000) - 5 * 60 * 1000,
@@ -1400,9 +1401,12 @@ export async function fetchKiroUsage(config: FetchConfig = {}): Promise<UsageDat
   if (creds.refresh && isCredentialExpired(creds, Date.now())) {
     try {
       creds = await refreshKiroAuth(creds, config);
-      if (auth) {
-        auth.kiro = creds;
-        writeAuth(auth, authFile);
+      // Re-read auth.json and merge only the kiro entry to avoid
+      // clobbering other providers' concurrent changes (e.g. type: "oauth").
+      const freshAuth = readAuth(authFile);
+      if (freshAuth) {
+        freshAuth.kiro = creds;
+        writeAuth(freshAuth, authFile);
       }
     } catch (error) {
       return { session: 0, weekly: 0, error: `auth refresh failed (${toErrorMessage(error)})` };
