@@ -6,13 +6,14 @@ export type ProviderKey = "codex" | "claude" | "zai" | "gemini" | "antigravity" 
 export type OAuthProviderId = "openai-codex" | "anthropic" | "google-gemini-cli" | "google-antigravity";
 
 export interface AuthData {
-  "openai-codex"?: { access?: string; refresh?: string; expires?: number };
-  anthropic?: { access?: string; refresh?: string; expires?: number };
-  zai?: { key?: string; access?: string; refresh?: string; expires?: number };
-  "google-gemini-cli"?: { access?: string; refresh?: string; projectId?: string; expires?: number };
-  "google-antigravity"?: { access?: string; refresh?: string; projectId?: string; expires?: number };
-  "opencode-go"?: { key?: string; access?: string; refresh?: string; expires?: number };
+  "openai-codex"?: { type?: string; access?: string; refresh?: string; expires?: number; [k: string]: unknown };
+  anthropic?: { type?: string; access?: string; refresh?: string; expires?: number; [k: string]: unknown };
+  zai?: { type?: string; key?: string; access?: string; refresh?: string; expires?: number; [k: string]: unknown };
+  "google-gemini-cli"?: { type?: string; access?: string; refresh?: string; projectId?: string; expires?: number; [k: string]: unknown };
+  "google-antigravity"?: { type?: string; access?: string; refresh?: string; projectId?: string; expires?: number; [k: string]: unknown };
+  "opencode-go"?: { type?: string; key?: string; access?: string; refresh?: string; expires?: number; [k: string]: unknown };
   kiro?: {
+    type?: string;
     access?: string;
     refresh?: string;
     expires?: number;
@@ -20,7 +21,9 @@ export interface AuthData {
     clientSecret?: string;
     region?: string;
     authMethod?: string;
+    [k: string]: unknown;
   };
+  [provider: string]: unknown;
 }
 
 export interface UsageData {
@@ -447,7 +450,17 @@ export async function ensureFreshAuthForProviders(
   }
 
   if (changed && config.persist !== false) {
-    writeAuth(nextAuth, authFile);
+    // Re-read the current file and merge only the providers we changed.
+    // This minimizes the race window with pi's AuthStorage (which uses
+    // proper-lockfile) and avoids overwriting fields like `type: "oauth"`
+    // that other writers may have set since our initial read.
+    const freshAuth = readAuth(authFile) ?? {};
+    for (const providerId of uniqueProviders) {
+      if ((nextAuth as any)[providerId]) {
+        (freshAuth as any)[providerId] = (nextAuth as any)[providerId];
+      }
+    }
+    writeAuth(freshAuth as AuthData, authFile);
   }
 
   return { auth: nextAuth, changed, refreshErrors };
