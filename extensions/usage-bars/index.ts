@@ -157,6 +157,7 @@ class UsageSelectorComponent extends Container implements Focusable {
       { key: "gemini", name: "Gemini" },
       { key: "antigravity", name: "Antigravity" },
       { key: "opencode-go", name: "OpenCode Go" },
+      { key: "kiro", name: "Kiro" },
     ];
 
     for (const p of otherProviders) {
@@ -210,6 +211,31 @@ class UsageSelectorComponent extends Container implements Focusable {
     } else if (item.data.error) {
       this.listContainer.addChild(new Text(indent + t.fg("error", item.data.error), 0, 0));
     } else {
+      // Kiro: single credits bar + plan title in header
+      if (item.provider === "kiro" && item.data.planTitle) {
+        this.listContainer.addChild(
+          new Text(indent + t.fg("accent", item.data.planTitle), 0, 0),
+        );
+      }
+
+      if (item.provider === "kiro") {
+        const credits = clampPercent(item.data.session);
+        const creditsReset = item.data.monthlyResetsIn
+          ? t.fg("dim", `  resets in ${item.data.monthlyResetsIn}`)
+          : "";
+        this.listContainer.addChild(
+          new Text(
+            indent +
+              t.fg("muted", "Credits  ") +
+              this.renderBar(credits) +
+              " " +
+              t.fg(colorForPercent(credits), `${credits}%`.padStart(4)) +
+              creditsReset,
+            0,
+            0,
+          ),
+        );
+      } else {
       const session = clampPercent(item.data.session);
       const weekly = clampPercent(item.data.weekly);
 
@@ -245,8 +271,9 @@ class UsageSelectorComponent extends Container implements Focusable {
           0,
         ),
       );
+      }
 
-      if (typeof item.data.monthly === "number") {
+      if (typeof item.data.monthly === "number" && item.provider !== "kiro") {
         const monthly = clampPercent(item.data.monthly);
         const monthlyReset = item.data.monthlyResetsIn
           ? t.fg("dim", `  resets in ${item.data.monthlyResetsIn}`)
@@ -348,6 +375,7 @@ export default function (pi: ExtensionAPI) {
     gemini: null,
     antigravity: null,
     "opencode-go": null,
+    kiro: null,
     lastPoll: 0,
     activeProvider: null,
     activeProviderName: null,
