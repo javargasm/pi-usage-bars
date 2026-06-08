@@ -221,7 +221,7 @@ class UsageSelectorComponent extends Container implements Focusable {
       if (item.provider === "kiro") {
         const creditsRaw = Math.max(0, Math.min(100, item.data.session));
         const creditsClamped = clampPercent(creditsRaw);
-        const creditsLabel = `${creditsRaw.toFixed(1)}%`;
+        const creditsLabel = `${creditsRaw.toFixed(2)}%`;
         const creditsReset = item.data.monthlyResetsIn
           ? t.fg("dim", `  resets in ${item.data.monthlyResetsIn}`)
           : "";
@@ -467,7 +467,7 @@ export default function (pi: ExtensionAPI) {
     if (active === "kiro") {
       const creditsRaw = Math.max(0, Math.min(100, data.session));
       const creditsClamped = clampPercent(creditsRaw);
-      const creditsLabel = `${creditsRaw.toFixed(1)}%`;
+      const creditsLabel = `${creditsRaw.toFixed(2)}%`;
       const creditsReset = data.monthlyResetsIn ? theme.fg("dim", ` ⟳ ${data.monthlyResetsIn}`) : "";
       const planSuffix = data.planTitle ? `${data.planTitle} ` : "";
       const creditsCount =
