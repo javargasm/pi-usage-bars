@@ -35,6 +35,8 @@ export interface UsageData {
   monthlyResetsAt?: string;
   extraSpend?: number;
   extraLimit?: number;
+  creditsUsed?: number;
+  creditsTotal?: number;
   warning?: string;
   stale?: boolean;
   fetchedAt?: number;
@@ -1452,6 +1454,8 @@ export async function fetchKiroUsage(config: FetchConfig = {}): Promise<UsageDat
     session: percentage,
     weekly: 0,
     monthly: percentage,
+    creditsUsed: usedCount,
+    creditsTotal: limitCount,
     fetchedAt: Date.now(),
   };
 

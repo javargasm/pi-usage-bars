@@ -219,17 +219,24 @@ class UsageSelectorComponent extends Container implements Focusable {
       }
 
       if (item.provider === "kiro") {
-        const credits = clampPercent(item.data.session);
+        const creditsRaw = Math.max(0, Math.min(100, item.data.session));
+        const creditsClamped = clampPercent(creditsRaw);
+        const creditsLabel = `${creditsRaw.toFixed(1)}%`;
         const creditsReset = item.data.monthlyResetsIn
           ? t.fg("dim", `  resets in ${item.data.monthlyResetsIn}`)
           : "";
+        const creditsCount =
+          typeof item.data.creditsUsed === "number" && typeof item.data.creditsTotal === "number"
+            ? t.fg("dim", `  (${item.data.creditsUsed}/${item.data.creditsTotal})`)
+            : "";
         this.listContainer.addChild(
           new Text(
             indent +
               t.fg("muted", "Credits  ") +
-              this.renderBar(credits) +
+              this.renderBar(creditsClamped) +
               " " +
-              t.fg(colorForPercent(credits), `${credits}%`.padStart(4)) +
+              t.fg(colorForPercent(creditsClamped), creditsLabel.padStart(6)) +
+              creditsCount +
               creditsReset,
             0,
             0,
@@ -458,17 +465,24 @@ export default function (pi: ExtensionAPI) {
 
     // Kiro uses a single credits bar instead of session+weekly
     if (active === "kiro") {
-      const credits = clampPercent(data.session);
+      const creditsRaw = Math.max(0, Math.min(100, data.session));
+      const creditsClamped = clampPercent(creditsRaw);
+      const creditsLabel = `${creditsRaw.toFixed(1)}%`;
       const creditsReset = data.monthlyResetsIn ? theme.fg("dim", ` ⟳ ${data.monthlyResetsIn}`) : "";
       const planSuffix = data.planTitle ? `${data.planTitle} ` : "";
+      const creditsCount =
+        typeof data.creditsUsed === "number" && typeof data.creditsTotal === "number"
+          ? theme.fg("dim", ` ${data.creditsUsed}/${data.creditsTotal}`)
+          : "";
 
       status =
         theme.fg("dim", `${label} `) +
         theme.fg("accent", planSuffix) +
         theme.fg("muted", "C ") +
-        renderBar(theme, credits) +
+        renderBar(theme, creditsClamped) +
         " " +
-        renderPercent(theme, credits) +
+        theme.fg(colorForPercent(creditsClamped), creditsLabel) +
+        creditsCount +
         creditsReset;
     } else {
       status =
