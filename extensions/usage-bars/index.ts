@@ -470,11 +470,6 @@ export default function (pi: ExtensionAPI) {
       const creditsLabel = `${creditsRaw.toFixed(2)}%`;
       const creditsReset = data.monthlyResetsIn ? theme.fg("dim", ` ⟳ ${data.monthlyResetsIn}`) : "";
       const planSuffix = data.planTitle ? `${data.planTitle} ` : "";
-      const creditsCount =
-        typeof data.creditsUsed === "number" && typeof data.creditsTotal === "number"
-          ? theme.fg("dim", ` ${data.creditsUsed}/${data.creditsTotal}`)
-          : "";
-
       status =
         theme.fg("dim", `${label} `) +
         theme.fg("accent", planSuffix) +
@@ -482,7 +477,6 @@ export default function (pi: ExtensionAPI) {
         renderBar(theme, creditsClamped) +
         " " +
         theme.fg(colorForPercent(creditsClamped), creditsLabel) +
-        creditsCount +
         creditsReset;
     } else {
       status =
