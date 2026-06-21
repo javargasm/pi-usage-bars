@@ -1,7 +1,7 @@
 {
-  "name": "pi-usage-bars",
+  "name": "@javargasm/pi-usage-bars",
   "version": "0.2.1",
-  "description": "Production-ready /usage bars extension for pi (Codex, Claude, Z.AI, Gemini CLI, Antigravity)",
+  "description": "Usage indicator for pi — footer status bars and /usage command for Codex, Claude, Z.AI, Gemini, Antigravity, OpenCode Go, and Kiro",
   "keywords": [
     "pi-package",
     "pi",
@@ -10,16 +10,18 @@
     "codex",
     "anthropic",
     "gemini",
-    "antigravity"
+    "antigravity",
+    "kiro",
+    "opencode-go"
   ],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ajarellanod/pi-usage-bars.git"
+    "url": "git+https://github.com/javargasm/pi-usage-bars.git"
   },
-  "homepage": "https://github.com/ajarellanod/pi-usage-bars#readme",
+  "homepage": "https://github.com/javargasm/pi-usage-bars#readme",
   "bugs": {
-    "url": "https://github.com/ajarellanod/pi-usage-bars/issues"
+    "url": "https://github.com/javargasm/pi-usage-bars/issues"
   },
   "type": "module",
   "files": [
@@ -30,7 +32,10 @@
   "scripts": {
     "test": "bun test tests/usage-bars-core.test.ts",
     "test:all": "bun run tests/run-all.ts",
-    "prepublishOnly": "npm run test"
+    "changeset": "changeset",
+    "version": "changeset version",
+    "publish:dry-run": "npm publish --dry-run",
+    "prepublishOnly": "bun run test"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -41,5 +46,16 @@
     "extensions": [
       "./extensions/usage-bars/index.ts"
     ]
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "^0.7.0",
+    "@changesets/cli": "^2.31.0"
   }
 }
