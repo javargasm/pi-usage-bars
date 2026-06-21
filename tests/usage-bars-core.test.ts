@@ -26,6 +26,7 @@ import {
   fetchGoogleUsage,
   fetchZaiUsage,
   fetchOpencodeGoUsage,
+  fetchKiroUsage,
   resolveOpencodeGoConfig,
   formatDuration,
   formatResetsAt,
@@ -1004,6 +1005,244 @@ describe("usage-bars-core network fetchers", () => {
       });
 
       expect(usage.error).toBe("HTTP 500");
+    });
+  });
+
+  describe("usage-bars-core kiro usage fetcher", () => {
+    // Regression: Kiro IDE users log in via the AWS SSO cache JSON
+    // (no OIDC clientId/secret) and get authMethod: "desktop" with
+    // refresh packed as `RT|||desktop`. fetchKiroUsage previously threw
+    // "missing clientId/clientSecret" on refresh and sent a GET with
+    // `Content-Type: application/json` (no `X-Amz-Target`) which AWS
+    // returned 403 for. These tests cover both fixes.
+
+    function makeAuthFile(auth: AuthData): string {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-usage-bars-kiro-"));
+      const file = path.join(tmpDir, "auth.json");
+      fs.writeFileSync(file, JSON.stringify(auth));
+      return file;
+    }
+
+    it("refreshes via the desktop endpoint when authMethod is desktop", async () => {
+      const calls: Array<{ url: string; init: RequestInit }> = [];
+      const fetchFn: FetchLike = async (url, init) => {
+        calls.push({ url: String(url), init: init ?? {} });
+        if (String(url).includes("auth.desktop.kiro.dev")) {
+          return jsonResponse(200, {
+            accessToken: "AT2",
+            refreshToken: "RT2",
+            expiresIn: 3600,
+          });
+        }
+        // getUsageLimits response
+        return jsonResponse(200, {
+          usageBreakdownList: [
+            { currentUsage: 30, usageLimit: 100, nextDateReset: "2026-07-01T00:00:00Z" },
+          ],
+          subscriptionInfo: { subscriptionTitle: "KIRO PRO" },
+        });
+      };
+
+      const auth: AuthData = {
+        kiro: {
+          type: "oauth",
+          access: "stale-AT",
+          refresh: "RT|||desktop",
+          expires: 0, // force refresh
+          clientId: "",
+          clientSecret: "",
+          region: "eu-central-1",
+          authMethod: "desktop",
+        },
+      };
+      const authFile = makeAuthFile(auth);
+
+      const usage = await fetchKiroUsage({ authFile, fetchFn });
+
+      // Refresh hit the desktop endpoint, NOT the OIDC one.
+      const refreshCall = calls.find((c) =>
+        c.url.includes("auth.desktop.kiro.dev/refreshToken"),
+      );
+      expect(refreshCall).toBeDefined();
+      expect(refreshCall!.init.method).toBe("POST");
+      expect(JSON.parse(refreshCall!.init.body as string)).toEqual({
+        refreshToken: "RT",
+      });
+      const oidcCall = calls.find((c) => c.url.includes("oidc."));
+      expect(oidcCall).toBeUndefined();
+
+      // Usage was parsed correctly.
+      expect(usage.session).toBe(30);
+      expect(usage.error).toBeUndefined();
+    });
+
+    it("refreshes via the OIDC endpoint when clientId/clientSecret are present", async () => {
+      const calls: Array<{ url: string; init: RequestInit }> = [];
+      const fetchFn: FetchLike = async (url, init) => {
+        calls.push({ url: String(url), init: init ?? {} });
+        if (String(url).includes("oidc.") && String(url).includes("/token")) {
+          return jsonResponse(200, {
+            accessToken: "AT2",
+            refreshToken: "RT2",
+            expiresIn: 3600,
+          });
+        }
+        return jsonResponse(200, {
+          usageBreakdownList: [{ currentUsage: 50, usageLimit: 100 }],
+        });
+      };
+
+      const auth: AuthData = {
+        kiro: {
+          type: "oauth",
+          access: "stale-AT",
+          refresh: "old-RT|CID|CSEC|idc",
+          expires: 0,
+          clientId: "CID",
+          clientSecret: "CSEC",
+          region: "us-east-1",
+          authMethod: "idc",
+        },
+      };
+      const authFile = makeAuthFile(auth);
+
+      await fetchKiroUsage({ authFile, fetchFn });
+
+      const refreshCall = calls.find((c) => c.url.includes("oidc.us-east-1.amazonaws.com/token"));
+      expect(refreshCall).toBeDefined();
+      expect(JSON.parse(refreshCall!.init.body as string)).toEqual({
+        clientId: "CID",
+        clientSecret: "CSEC",
+        refreshToken: "old-RT",
+        grantType: "refresh_token",
+      });
+    });
+
+    it("falls back to the desktop endpoint when clientId/clientSecret are missing even if authMethod is idc", async () => {
+      // Defensive: the packed refresh string can disagree with the
+      // struct authMethod. If the struct says "idc" but the pack has
+      // no clientId/secret (or the struct fields are empty), route
+      // through the desktop endpoint instead of throwing.
+      const calls: Array<{ url: string; init: RequestInit }> = [];
+      const fetchFn: FetchLike = async (url, init) => {
+        calls.push({ url: String(url), init: init ?? {} });
+        if (String(url).includes("auth.desktop.kiro.dev")) {
+          return jsonResponse(200, {
+            accessToken: "AT2",
+            refreshToken: "RT2",
+            expiresIn: 3600,
+          });
+        }
+        return jsonResponse(200, {
+          usageBreakdownList: [{ currentUsage: 10, usageLimit: 100 }],
+        });
+      };
+
+      const auth: AuthData = {
+        kiro: {
+          type: "oauth",
+          access: "stale-AT",
+          refresh: "RT|||desktop", // pack says desktop
+          expires: 0,
+          clientId: "",
+          clientSecret: "",
+          region: "eu-central-1",
+          authMethod: "idc", // struct says idc (mismatch)
+        },
+      };
+      const authFile = makeAuthFile(auth);
+
+      const usage = await fetchKiroUsage({ authFile, fetchFn });
+
+      const refreshCall = calls.find((c) =>
+        c.url.includes("auth.desktop.kiro.dev/refreshToken"),
+      );
+      expect(refreshCall).toBeDefined();
+      const oidcCall = calls.find((c) => c.url.includes("oidc.") && c.url.includes("/token"));
+      expect(oidcCall).toBeUndefined();
+      expect(usage.session).toBe(10);
+    });
+
+    it("sends the AWS service routing headers on getUsageLimits (Content-Type + X-Amz-Target)", async () => {
+      // Regression: the old GET-with-query-params call used
+      // `Content-Type: application/json` and no `X-Amz-Target`, which
+      // AWS returns 403 for. The new POST shape uses
+      // `application/x-amz-json-1.0` + `AmazonCodeWhispererService.GetUsageLimits`.
+      const calls: Array<{ url: string; init: RequestInit }> = [];
+      const fetchFn: FetchLike = async (url, init) => {
+        calls.push({ url: String(url), init: init ?? {} });
+        return jsonResponse(200, {
+          usageBreakdownList: [{ currentUsage: 5, usageLimit: 100 }],
+        });
+      };
+
+      const auth: AuthData = {
+        kiro: {
+          type: "oauth",
+          access: "AT",
+          refresh: "RT|||desktop",
+          expires: Date.now() + 3600 * 1000, // not expired
+          clientId: "",
+          clientSecret: "",
+          region: "eu-central-1",
+          authMethod: "desktop",
+        },
+      };
+      const authFile = makeAuthFile(auth);
+
+      await fetchKiroUsage({ authFile, fetchFn });
+
+      // The profile-resolve call also POSTs to the same root URL, so
+      // pick the one whose X-Amz-Target is GetUsageLimits specifically.
+      const usageCall = calls.find(
+        (c) =>
+          c.url === "https://q.eu-central-1.amazonaws.com/" &&
+          c.init.method === "POST" &&
+          (c.init.headers as Record<string, string>)["X-Amz-Target"] ===
+            "AmazonCodeWhispererService.GetUsageLimits",
+      );
+      expect(usageCall).toBeDefined();
+      const headers = usageCall!.init.headers as Record<string, string>;
+      expect(headers["Content-Type"]).toBe("application/x-amz-json-1.0");
+      expect(headers["X-Amz-Target"]).toBe("AmazonCodeWhispererService.GetUsageLimits");
+      expect(headers["x-amzn-codewhisperer-optout"]).toBe("true");
+      expect(headers["amz-sdk-invocation-id"]).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+      );
+      expect(headers["amz-sdk-request"]).toBe("attempt=1; max=1");
+      expect(headers["x-amzn-kiro-agent-mode"]).toBe("vibe");
+      expect(headers["Authorization"]).toBe("Bearer AT");
+
+      // The body should carry the params as JSON, not as query string.
+      const body = JSON.parse(usageCall!.init.body as string);
+      expect(body.isEmailRequired).toBe(true);
+      expect(body.origin).toBe("AI_EDITOR");
+    });
+
+    it("returns a useful error when both refresh and usage fail", async () => {
+      const fetchFn: FetchLike = async (url) => {
+        if (String(url).includes("auth.desktop.kiro.dev")) {
+          return jsonResponse(401, {});
+        }
+        return jsonResponse(403, {});
+      };
+
+      const auth: AuthData = {
+        kiro: {
+          type: "oauth",
+          access: "stale-AT",
+          refresh: "RT|||desktop",
+          expires: 0,
+          clientId: "",
+          clientSecret: "",
+          region: "eu-central-1",
+          authMethod: "desktop",
+        },
+      };
+      const authFile = makeAuthFile(auth);
+
+      const usage = await fetchKiroUsage({ authFile, fetchFn });
+      expect(usage.error).toMatch(/auth refresh failed/);
     });
   });
 });

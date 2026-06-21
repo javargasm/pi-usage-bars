@@ -1300,7 +1300,17 @@ function resolveKiroApiRegion(ssoRegion: string): string {
 }
 
 /**
- * Refreshes a Kiro token using the AWS SSO-OIDC token endpoint.
+ * Refreshes a Kiro token. Dispatches to the appropriate endpoint based
+ * on `authMethod`:
+ *   - `desktop` (or any variant with no OIDC clientId/clientSecret):
+ *     hits the Kiro desktop refresh endpoint
+ *     (`https://prod.${region}.auth.desktop.kiro.dev/refreshToken`) and
+ *     keeps the pack ending in `|||desktop`. This is the path used by
+ *     Kiro IDE users whose credentials are sourced from the AWS SSO
+ *     cache JSON (which never carries the OIDC clientId/secret).
+ *   - `idc` / `builder-id`: hits the standard AWS SSO-OIDC token
+ *     endpoint with the OIDC clientId/clientSecret packed into the
+ *     refresh string. Requires clientId and clientSecret to be present.
  *
  * The refresh token in auth.json is packed as:
  * `refreshToken|clientId|clientSecret|authMethod`
@@ -1316,8 +1326,16 @@ async function refreshKiroAuth(
   const authMethod = creds.authMethod ?? parts[3] ?? "idc";
   const region = creds.region ?? "us-east-1";
 
-  if (!refreshToken || !clientId || !clientSecret) {
-    throw new Error("Kiro refresh token missing clientId/clientSecret — re-login required");
+  if (!refreshToken) {
+    throw new Error("Kiro refresh token is empty — re-login required");
+  }
+
+  // Desktop / non-OIDC flow: no clientId/secret available. The Kiro
+  // desktop endpoint accepts a bare refresh token and is the only
+  // viable refresh path for credentials imported from Kiro IDE's AWS
+  // SSO cache JSON.
+  if (authMethod === "desktop" || !clientId || !clientSecret) {
+    return refreshKiroDesktop(refreshToken, region, config);
   }
 
   const endpoint = `https://oidc.${region}.amazonaws.com/token`;
@@ -1344,6 +1362,51 @@ async function refreshKiroAuth(
     clientSecret,
     region,
     authMethod,
+  };
+}
+
+/**
+ * Refresh a Kiro token via the Kiro desktop endpoint. The endpoint
+ * accepts a bare refresh token (no clientId/clientSecret required) and
+ * returns new access + refresh tokens. Region comes from auth.json.
+ */
+async function refreshKiroDesktop(
+  refreshToken: string,
+  region: string,
+  config: RequestConfig = {},
+): Promise<NonNullable<AuthData["kiro"]>> {
+  const endpoint = `https://prod.${region}.auth.desktop.kiro.dev/refreshToken`;
+  const fetchFn = config.fetchFn ?? ((fetch as unknown) as FetchLike);
+
+  const response = await fetchFn(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "User-Agent": "pi-usage-bars" },
+    body: JSON.stringify({ refreshToken }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Kiro desktop token refresh failed: HTTP ${response.status} ${text}`);
+  }
+
+  const data = (await response.json()) as {
+    accessToken: string;
+    refreshToken: string;
+    expiresIn?: number;
+  };
+
+  return {
+    type: "oauth",
+    access: data.accessToken,
+    // Pack ends in `|||desktop` to keep struct authMethod and pack
+    // suffix aligned — the next refresh must dispatch to the same
+    // endpoint, not the OIDC one.
+    refresh: `${data.refreshToken}|||desktop`,
+    expires: Date.now() + ((data.expiresIn ?? 3600) * 1000) - 5 * 60 * 1000,
+    clientId: "",
+    clientSecret: "",
+    region,
+    authMethod: "desktop",
   };
 }
 
@@ -1422,22 +1485,36 @@ export async function fetchKiroUsage(config: FetchConfig = {}): Promise<UsageDat
   // Resolve profile ARN
   const profileArn = await resolveKiroProfileArn(creds.access, apiRegion, config);
 
-  // Call getUsageLimits
-  const url = new URL(`https://q.${apiRegion}.amazonaws.com/getUsageLimits`);
-  url.searchParams.set("isEmailRequired", "true");
-  url.searchParams.set("origin", "AI_EDITOR");
-  if (profileArn) url.searchParams.set("profileArn", profileArn);
+  // Call getUsageLimits via the AmazonCodeWhispererService JSON 1.0
+  // endpoint. The GET-with-query-params variant returned 403 because
+  // it was missing the AWS service routing headers
+  // (`Content-Type: application/x-amz-json-1.0` and the
+  // `X-Amz-Target: AmazonCodeWhispererService.GetUsageLimits` that AWS
+  // uses to dispatch to the right operation). The POST + X-Amz-Target
+  // shape mirrors `resolveKiroProfileArn` and is what the Kiro CLI
+  // actually sends.
+  const usageBody: Record<string, unknown> = {
+    isEmailRequired: true,
+    origin: "AI_EDITOR",
+  };
+  if (profileArn) usageBody.profileArn = profileArn;
 
   const result = await requestJson(
-    url.toString(),
+    `https://q.${apiRegion}.amazonaws.com/`,
     {
-      method: "GET",
+      method: "POST",
       headers: {
+        "Content-Type": "application/x-amz-json-1.0",
+        Accept: "application/json",
         Authorization: `Bearer ${creds.access}`,
-        "Content-Type": "application/json",
-        "x-amzn-kiro-agent-mode": "vibe",
+        "X-Amz-Target": "AmazonCodeWhispererService.GetUsageLimits",
+        "x-amzn-codewhisperer-optout": "true",
+        "amz-sdk-invocation-id": crypto.randomUUID(),
         "amz-sdk-request": "attempt=1; max=1",
+        "x-amzn-kiro-agent-mode": "vibe",
+        "User-Agent": "pi-usage-bars",
       },
+      body: JSON.stringify(usageBody),
     },
     config,
   );
